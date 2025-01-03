@@ -31,6 +31,22 @@ fn decode_bencoded_value(encoded_value: &str) -> anyhow::Result<(serde_json::Val
 
             Ok((list.into(), &rest[1..]))
         }
+        Some('d') => {
+            let mut dict = serde_json::Map::new();
+            let mut rest = &encoded_value[1..];
+
+            while !rest.is_empty() && rest.chars().next() != Some('e') {
+                let (key, new_rest) = match decode_bencoded_value(rest)? {
+                    (serde_json::Value::String(key), new_rest) => (key, new_rest),
+                    _ => panic!("Invalid key in dictionary"),
+                };
+                let (value, new_rest) = decode_bencoded_value(new_rest)?;
+                rest = new_rest;
+                dict.insert(key, value);
+            }
+
+            Ok((dict.into(), &rest[1..]))
+        }
         // <length of str>:<string>
         Some('0'..='9') => {
             if let Some((length, rest)) = encoded_value.split_once(':') {
@@ -76,8 +92,8 @@ fn main() -> anyhow::Result<()> {
 
         // Uncomment this block to pass the first stage
         let encoded_value = &args[2];
-        let decoded_value = decode_bencoded_value(encoded_value)?;
-        println!("{}", decoded_value.0.to_string());
+        let (decoded_value, _) = decode_bencoded_value(encoded_value)?;
+        println!("{}", decoded_value.to_string());
     } else {
         println!("unknown command: {}", args[1])
     }
