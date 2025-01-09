@@ -1,7 +1,7 @@
 use serde_json;
 use std::env;
-// Available if you need it!
-// use serde_bencode
+use serde::{Serialize, Deserialize};
+use sha1::{Sha1, Digest};
 
 #[derive(serde::Deserialize, PartialEq, Eq, Debug)]
 struct Torrent {
@@ -9,7 +9,7 @@ struct Torrent {
     info: TorrentInfo,
 }
 
-#[derive(serde::Deserialize, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 struct TorrentInfo {
     name: String,
     #[serde(rename = "piece length")]
@@ -17,6 +17,14 @@ struct TorrentInfo {
     #[serde(with = "serde_bytes")]
     pieces: Vec<u8>,
     length: usize,
+}
+
+impl TorrentInfo {
+    fn hash(&self) -> String {
+        let mut hasher = Sha1::new();
+        hasher.update(serde_bencode::to_bytes(&self).unwrap());
+        format!("{:x}", hasher.finalize())
+    }
 }
 
 fn decode_bencoded_value(encoded_value: &str) -> anyhow::Result<serde_json::Value> {
@@ -64,6 +72,7 @@ fn main() -> anyhow::Result<()> {
         let torrent = serde_bencode::from_bytes::<Torrent>(&file.as_slice())?;
         println!("Tracker URL: {}", torrent.announce);
         println!("Length: {}", torrent.info.length);
+        println!("Info Hash: {}", torrent.info.hash());
     } else {
         println!("unknown command: {}", args[1])
     }
