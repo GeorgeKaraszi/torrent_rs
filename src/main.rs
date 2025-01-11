@@ -73,6 +73,11 @@ fn main() -> anyhow::Result<()> {
         println!("Tracker URL: {}", torrent.announce);
         println!("Length: {}", torrent.info.length);
         println!("Info Hash: {}", torrent.info.hash());
+        println!("Piece Length: {}", torrent.info.piece_length);
+        println!("Pieces:");
+        for hash in torrent.info.pieces.hashes() {
+            println!("{}", hash);
+        }
     } else {
         println!("unknown command: {}", args[1])
     }
