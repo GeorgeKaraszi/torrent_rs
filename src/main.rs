@@ -2,20 +2,20 @@ use serde_json;
 use std::env;
 use serde::{Serialize, Deserialize};
 use sha1::{Sha1, Digest};
+use codecrafters_bittorrent::PiecesHashes;
 
-#[derive(serde::Deserialize, PartialEq, Eq, Debug)]
+#[derive(serde::Deserialize, Debug)]
 struct Torrent {
     announce: String,
     info: TorrentInfo,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug)]
 struct TorrentInfo {
     name: String,
     #[serde(rename = "piece length")]
     piece_length: usize,
-    #[serde(with = "serde_bytes")]
-    pieces: Vec<u8>,
+    pieces: PiecesHashes,
     length: usize,
 }
 
