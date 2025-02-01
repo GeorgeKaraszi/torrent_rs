@@ -21,7 +21,7 @@ enum Command {
     Decode { value: String },
     Info { torrent: PathBuf },
     Peers { torrent: PathBuf },
-    Handshake { torrent: PathBuf },
+    Handshake { torrent: PathBuf, peer: String },
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -112,7 +112,10 @@ async fn fetch_tracker_info(torrent: &Torrent) -> anyhow::Result<TrackerResponse
     Ok(response)
 }
 
-async fn handshake_with_peers(tracker_response: &TrackerResponse) -> anyhow::Result<()> {
+async fn handshake_with_peers(
+    tracker_response: &TrackerResponse,
+    peer: String,
+) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -147,10 +150,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}:{}", peer.ip, peer.port);
             }
         }
-        Command::Handshake { torrent } => {
+        Command::Handshake { torrent, peer } => {
             let torrent = read_torrent_file(torrent)?;
             let torrent_response = fetch_tracker_info(&torrent).await?;
-            handshake_with_peers(&torrent_response).await?;
+            handshake_with_peers(&torrent_response, peer).await?;
         }
     }
 
