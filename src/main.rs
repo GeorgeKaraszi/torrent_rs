@@ -150,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Handshake { torrent } => {
             let torrent = read_torrent_file(torrent)?;
             let torrent_response = fetch_tracker_info(&torrent).await?;
-            handshake_with_peers(torrent_response).await?;
+            handshake_with_peers(&torrent_response).await?;
         }
     }
 
