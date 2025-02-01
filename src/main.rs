@@ -120,7 +120,7 @@ fn read_torrent_file(torrent: PathBuf) -> anyhow::Result<Torrent> {
     Ok(torrent)
 }
 
-// Usage: your_bittorrent.sh decode "<encoded_value>"
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -147,38 +147,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-
-    // let args: Vec<String> = env::args().collect();
-    // let command = &args[1];
-    //
-    // if command == "decode" {
-    //     // Uncomment this block to pass the first stage
-    //     let encoded_value = &args[2];
-    //     let decoded_value = decode_bencoded_value(encoded_value)?;
-    //     println!("{}", decoded_value.to_string());
-    // } else if command == "info" {
-    //     let file_path = &args[2];
-    //     let file = std::fs::read(file_path)?;
-    //     let torrent = serde_bencode::from_bytes::<Torrent>(&file.as_slice())?;
-    //     println!("Tracker URL: {}", torrent.announce);
-    //     println!("Length: {}", torrent.info.length);
-    //     println!("Info Hash: {}", torrent.info.hash());
-    //     println!("Piece Length: {}", torrent.info.piece_length);
-    //     println!("Pieces:");
-    //     for hash in torrent.info.pieces.hashes() {
-    //         println!("{}", hash);
-    //     }
-    // } else if command == "peers" {
-    //     let file_path = &args[2];
-    //     let file = std::fs::read(file_path)?;
-    //     let torrent = serde_bencode::from_bytes::<Torrent>(&file.as_slice())?;
-    //     let response = fetch_tracker_info(&torrent).await?;
-    //     for peer in response.peers.iter() {
-    //         println!("{}", peer.ip_address());
-    //     }
-    // } else {
-    //     println!("unknown command: {}", args[1])
-    // }
 
     Ok(())
 }
