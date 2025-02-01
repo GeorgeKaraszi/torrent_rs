@@ -12,8 +12,7 @@ impl PiecesHashes {
     pub fn hashes(&self) -> Vec<String> {
         let mut hashes = Vec::new();
         for hash in &self.0 {
-            let hex = hash.iter().map(|byte| format!("{:02x}", byte)).collect();
-            hashes.push(hex);
+            hashes.push(hex::encode(hash));
         }
 
         hashes
