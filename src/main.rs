@@ -7,8 +7,7 @@ use serde_json;
 use sha1::digest::Output;
 use sha1::{Digest, Sha1, Sha1Core};
 use std::path::PathBuf;
-use crate::tracker::TorrentResponse;
-use tracker::TorrentRequest;
+use tracker::{TackerRequest, TrackerResponse};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -22,6 +21,7 @@ enum Command {
     Decode { value: String },
     Info { torrent: PathBuf },
     Peers { torrent: PathBuf },
+    Handshake { torrent: PathBuf },
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -90,8 +90,8 @@ fn convert(value: serde_bencode::value::Value) -> anyhow::Result<serde_json::Val
     }
 }
 
-async fn fetch_tracker_info(torrent: &Torrent) -> anyhow::Result<TorrentResponse> {
-    let req = TorrentRequest {
+async fn fetch_tracker_info(torrent: &Torrent) -> anyhow::Result<TrackerResponse> {
+    let req = TackerRequest {
         peer_id: "-PC0001-123456700012".to_string(),
         port: 6881,
         uploaded: 0,
@@ -107,10 +107,13 @@ async fn fetch_tracker_info(torrent: &Torrent) -> anyhow::Result<TorrentResponse
 
     let response = reqwest::get(url).await.expect("Fetching tracker info");
     let response = response.bytes().await.expect("Reading response");
-    let response = serde_bencode::from_bytes::<TorrentResponse>(&response)?;
+    let response = serde_bencode::from_bytes::<TrackerResponse>(&response)?;
 
-    println!("{:?}", response);
     Ok(response)
+}
+
+async fn handshake_with_peers(tracker_response: &TrackerResponse) -> anyhow::Result<()> {
+    Ok(())
 }
 
 fn read_torrent_file(torrent: PathBuf) -> anyhow::Result<Torrent> {
@@ -118,7 +121,6 @@ fn read_torrent_file(torrent: PathBuf) -> anyhow::Result<Torrent> {
     let torrent = serde_bencode::from_bytes::<Torrent>(&file.as_slice())?;
     Ok(torrent)
 }
-
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -142,8 +144,13 @@ async fn main() -> anyhow::Result<()> {
             let torrent = read_torrent_file(torrent)?;
             let torrent_response = fetch_tracker_info(&torrent).await?;
             for peer in torrent_response.peers.iter() {
-                println!("{}", peer.ip_address());
+                println!("{}:{}", peer.ip, peer.port);
             }
+        }
+        Command::Handshake { torrent } => {
+            let torrent = read_torrent_file(torrent)?;
+            let torrent_response = fetch_tracker_info(&torrent).await?;
+            handshake_with_peers(torrent_response).await?;
         }
     }
 

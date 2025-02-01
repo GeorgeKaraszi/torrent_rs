@@ -2,7 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::net::{IpAddr, Ipv4Addr};
 
 #[derive(Debug, Serialize)]
-pub struct TorrentRequest {
+pub struct TackerRequest {
     pub peer_id: String,
     pub port: u16,
     pub uploaded: u16,
@@ -13,7 +13,7 @@ pub struct TorrentRequest {
 
 #[derive(Debug, Deserialize)]
 #[warn(dead_code)]
-pub struct TorrentResponse {
+pub struct TrackerResponse {
     pub interval: u32,
     pub peers: Peers,
 }
@@ -30,12 +30,6 @@ pub struct Peer {
 impl Peers {
     pub fn iter(&self) -> impl Iterator<Item = &Peer> {
         self.0.iter()
-    }
-}
-
-impl Peer {
-    pub fn ip_address(&self) -> String {
-        format!("{}:{}", self.ip, self.port)
     }
 }
 
