@@ -1,14 +1,29 @@
 mod tracker;
 
+use clap::{Parser, Subcommand};
 use codecrafters_bittorrent::PiecesHashes;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use sha1::digest::Output;
 use sha1::{Digest, Sha1, Sha1Core};
-use std::env;
+use std::path::PathBuf;
 // use serde_bencode::value::Value;
 use crate::tracker::TorrentResponse;
 use tracker::TorrentRequest;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    Decode { value: String },
+    Info { torrent: PathBuf },
+    Peers { torrent: PathBuf },
+}
 
 #[derive(serde::Deserialize, Debug)]
 struct Torrent {
@@ -47,8 +62,8 @@ impl TorrentInfo {
     }
 }
 
-fn decode_bencoded_value(encoded_value: &str) -> anyhow::Result<serde_json::Value> {
-    let value: serde_bencode::value::Value = serde_bencode::from_str(encoded_value)?;
+fn decode_bencoded_value(encoded_value: String) -> anyhow::Result<serde_json::Value> {
+    let value: serde_bencode::value::Value = serde_bencode::from_str(encoded_value.as_str())?;
     convert(value)
 }
 
@@ -99,40 +114,71 @@ async fn fetch_tracker_info(torrent: &Torrent) -> anyhow::Result<TorrentResponse
     Ok(response)
 }
 
+fn read_torrent_file(torrent: PathBuf) -> anyhow::Result<Torrent> {
+    let file = std::fs::read(torrent)?;
+    let torrent = serde_bencode::from_bytes::<Torrent>(&file.as_slice())?;
+    Ok(torrent)
+}
+
 // Usage: your_bittorrent.sh decode "<encoded_value>"
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    let command = &args[1];
+    let args = Args::parse();
 
-    if command == "decode" {
-        // Uncomment this block to pass the first stage
-        let encoded_value = &args[2];
-        let decoded_value = decode_bencoded_value(encoded_value)?;
-        println!("{}", decoded_value.to_string());
-    } else if command == "info" {
-        let file_path = &args[2];
-        let file = std::fs::read(file_path)?;
-        let torrent = serde_bencode::from_bytes::<Torrent>(&file.as_slice())?;
-        println!("Tracker URL: {}", torrent.announce);
-        println!("Length: {}", torrent.info.length);
-        println!("Info Hash: {}", torrent.info.hash());
-        println!("Piece Length: {}", torrent.info.piece_length);
-        println!("Pieces:");
-        for hash in torrent.info.pieces.hashes() {
-            println!("{}", hash);
+    match args.command {
+        Command::Decode { value } => {
+            println!("{}", decode_bencoded_value(value)?.to_string());
         }
-    } else if command == "peers" {
-        let file_path = &args[2];
-        let file = std::fs::read(file_path)?;
-        let torrent = serde_bencode::from_bytes::<Torrent>(&file.as_slice())?;
-        let response = fetch_tracker_info(&torrent).await?;
-        for peer in response.peers.iter() {
-            println!("{}", peer.ip_address());
+        Command::Info { torrent } => {
+            let torrent = read_torrent_file(torrent)?;
+            println!("Tracker URL: {}", torrent.announce);
+            println!("Length: {}", torrent.info.length);
+            println!("Info Hash: {}", torrent.info.hash());
+            println!("Piece Length: {}", torrent.info.piece_length);
+            for hash in torrent.info.pieces.hashes() {
+                println!("{}", hash);
+            }
         }
-    } else {
-        println!("unknown command: {}", args[1])
+        Command::Peers { torrent } => {
+            let torrent = read_torrent_file(torrent)?;
+            let torrent_response = fetch_tracker_info(&torrent).await?;
+            for peer in torrent_response.peers.iter() {
+                println!("{}", peer.ip_address());
+            }
+        }
     }
+
+    // let args: Vec<String> = env::args().collect();
+    // let command = &args[1];
+    //
+    // if command == "decode" {
+    //     // Uncomment this block to pass the first stage
+    //     let encoded_value = &args[2];
+    //     let decoded_value = decode_bencoded_value(encoded_value)?;
+    //     println!("{}", decoded_value.to_string());
+    // } else if command == "info" {
+    //     let file_path = &args[2];
+    //     let file = std::fs::read(file_path)?;
+    //     let torrent = serde_bencode::from_bytes::<Torrent>(&file.as_slice())?;
+    //     println!("Tracker URL: {}", torrent.announce);
+    //     println!("Length: {}", torrent.info.length);
+    //     println!("Info Hash: {}", torrent.info.hash());
+    //     println!("Piece Length: {}", torrent.info.piece_length);
+    //     println!("Pieces:");
+    //     for hash in torrent.info.pieces.hashes() {
+    //         println!("{}", hash);
+    //     }
+    // } else if command == "peers" {
+    //     let file_path = &args[2];
+    //     let file = std::fs::read(file_path)?;
+    //     let torrent = serde_bencode::from_bytes::<Torrent>(&file.as_slice())?;
+    //     let response = fetch_tracker_info(&torrent).await?;
+    //     for peer in response.peers.iter() {
+    //         println!("{}", peer.ip_address());
+    //     }
+    // } else {
+    //     println!("unknown command: {}", args[1])
+    // }
 
     Ok(())
 }
