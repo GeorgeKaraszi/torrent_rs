@@ -7,7 +7,6 @@ use serde_json;
 use sha1::digest::Output;
 use sha1::{Digest, Sha1, Sha1Core};
 use std::path::PathBuf;
-// use serde_bencode::value::Value;
 use crate::tracker::TorrentResponse;
 use tracker::TorrentRequest;
 
