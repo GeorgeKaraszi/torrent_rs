@@ -1,13 +1,17 @@
 mod tracker;
 
+use anyhow::{Context, Error};
 use clap::{Parser, Subcommand};
 use codecrafters_bittorrent::PiecesHashes;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use sha1::digest::Output;
-use sha1::{Digest, Sha1, Sha1Core};
+use sha1::{Digest, Sha1};
 use std::path::PathBuf;
-use tracker::{TackerRequest, TrackerResponse};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tracker::{PeerHandshake, TackerRequest, TrackerResponse};
+
+const PEER_ID: &[u8; 20] = b"-PC0001-123456701112";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -40,17 +44,14 @@ struct TorrentInfo {
 }
 
 impl TorrentInfo {
-    fn hasher(&self) -> Output<Sha1Core> {
+    fn hash(&self) -> [u8; 20] {
         let mut hasher = Sha1::new();
         Digest::update(&mut hasher, serde_bencode::to_bytes(&self).unwrap());
-        hasher.finalize()
-    }
-    fn hash(&self) -> String {
-        hex::encode(&self.hasher())
+        hasher.finalize().try_into().unwrap()
     }
 
-    fn url_hash(&self) -> String {
-        let hashed = self.hasher();
+    fn encoded_hash(&self) -> String {
+        let hashed = self.hash();
         let mut encoded = String::with_capacity(hashed.len() * 3);
         for byte in hashed.iter() {
             encoded.push('%');
@@ -92,7 +93,7 @@ fn convert(value: serde_bencode::value::Value) -> anyhow::Result<serde_json::Val
 
 async fn fetch_tracker_info(torrent: &Torrent) -> anyhow::Result<TrackerResponse> {
     let req = TackerRequest {
-        peer_id: "-PC0001-123456700012".to_string(),
+        peer_id: std::str::from_utf8(PEER_ID)?.to_string(),
         port: 6881,
         uploaded: 0,
         downloaded: 0,
@@ -102,7 +103,7 @@ async fn fetch_tracker_info(torrent: &Torrent) -> anyhow::Result<TrackerResponse
 
     let params = serde_urlencoded::to_string(&req)?;
 
-    let info_hash = torrent.info.url_hash();
+    let info_hash = torrent.info.encoded_hash();
     let url = format!("{}?{}&info_hash={}", torrent.announce, params, info_hash);
 
     let response = reqwest::get(url).await.expect("Fetching tracker info");
@@ -112,10 +113,33 @@ async fn fetch_tracker_info(torrent: &Torrent) -> anyhow::Result<TrackerResponse
     Ok(response)
 }
 
-async fn handshake_with_peers(
-    tracker_response: &TrackerResponse,
-    peer: String,
-) -> anyhow::Result<()> {
+async fn handshake_from_peer(torrent: &Torrent, peer: String) -> anyhow::Result<(), Error> {
+    let mut connection = TcpStream::connect(peer)
+        .await
+        .expect("Failed to connect to peer");
+
+    let mut handshake = PeerHandshake::new(torrent.info.hash(), *PEER_ID);
+
+    {
+        let handshake_bytes =
+            &mut handshake as *mut PeerHandshake as *mut [u8; size_of::<PeerHandshake>()];
+
+        let handshake_bytes: &mut [u8; size_of::<PeerHandshake>()] =
+            unsafe { &mut *handshake_bytes };
+
+        connection
+            .write_all(handshake_bytes)
+            .await
+            .context("Write Handshake")?;
+
+        connection
+            .read_exact(handshake_bytes)
+            .await
+            .context("Read Handshake")?;
+    }
+
+    println!("Peer ID: {}", hex::encode(handshake.peer_id));
+
     Ok(())
 }
 
@@ -137,9 +161,9 @@ async fn main() -> anyhow::Result<()> {
             let torrent = read_torrent_file(torrent)?;
             println!("Tracker URL: {}", torrent.announce);
             println!("Length: {}", torrent.info.length);
-            println!("Info Hash: {}", torrent.info.hash());
+            println!("Info Hash: {}", hex::encode(torrent.info.hash()));
             println!("Piece Length: {}", torrent.info.piece_length);
-            for hash in torrent.info.pieces.hashes() {
+            for hash in torrent.info.pieces.encoded_hashes() {
                 println!("{}", hash);
             }
         }
@@ -152,8 +176,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Handshake { torrent, peer } => {
             let torrent = read_torrent_file(torrent)?;
-            let torrent_response = fetch_tracker_info(&torrent).await?;
-            handshake_with_peers(&torrent_response, peer).await?;
+            handshake_from_peer(&torrent, peer).await?;
         }
     }
 

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use std::net::{IpAddr, Ipv4Addr};
+use std::ops::{Deref, DerefMut};
 
 #[derive(Debug, Serialize)]
 pub struct TackerRequest {
@@ -14,7 +15,8 @@ pub struct TackerRequest {
 #[derive(Debug, Deserialize)]
 #[warn(dead_code)]
 pub struct TrackerResponse {
-    pub interval: u32,
+    #[serde(rename = "interval")]
+    pub _interval: u32,
     pub peers: Peers,
 }
 
@@ -27,11 +29,42 @@ pub struct Peer {
     pub port: u16,
 }
 
-impl Peers {
-    pub fn iter(&self) -> impl Iterator<Item = &Peer> {
-        self.0.iter()
+#[repr(C)]
+#[derive(Debug)]
+pub struct PeerHandshake {
+    pub protocol_length: u8,
+    pub protocol: [u8; 19],
+    pub reserved: [u8; 8],
+    pub info_hash: [u8; 20],
+    pub peer_id: [u8; 20],
+}
+
+impl PeerHandshake {
+    pub fn new(info_hash: [u8; 20], peer_id: [u8; 20]) -> Self {
+        Self {
+            protocol_length: 19,
+            protocol: *b"BitTorrent protocol",
+            reserved: [0; 8],
+            info_hash: info_hash,
+            peer_id: peer_id,
+        }
     }
 }
+
+impl Deref for Peers {
+    type Target = Vec<Peer>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Peers {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 
 impl<'de> Deserialize<'de> for Peers {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>

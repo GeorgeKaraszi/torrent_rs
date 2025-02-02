@@ -9,9 +9,9 @@ impl PiecesHashes {
         self.0.iter()
     }
 
-    pub fn hashes(&self) -> Vec<String> {
+    pub fn encoded_hashes(&self) -> Vec<String> {
         let mut hashes = Vec::new();
-        for hash in &self.0 {
+        for hash in self.iter() {
             hashes.push(hex::encode(hash));
         }
 
