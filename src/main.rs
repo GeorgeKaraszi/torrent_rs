@@ -1,16 +1,12 @@
-mod tracker;
-
 use anyhow::{Context, Error};
 use clap::{Parser, Subcommand};
-use codecrafters_bittorrent::PiecesHashes;
-use serde::{Deserialize, Serialize};
+use codecrafters_bittorrent::peer::PeerHandshake;
+use codecrafters_bittorrent::torrent::Torrent;
+use codecrafters_bittorrent::tracker::{TackerRequest, TrackerResponse};
 use serde_json;
-use sha1::{Digest, Sha1};
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracker::{PeerHandshake, TackerRequest, TrackerResponse};
-
 const PEER_ID: &[u8; 20] = b"-PC0001-123456701112";
 
 #[derive(Parser, Debug)]
@@ -26,40 +22,6 @@ enum Command {
     Info { torrent: PathBuf },
     Peers { torrent: PathBuf },
     Handshake { torrent: PathBuf, peer: String },
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct Torrent {
-    announce: String,
-    info: TorrentInfo,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct TorrentInfo {
-    name: String,
-    #[serde(rename = "piece length")]
-    piece_length: usize,
-    pieces: PiecesHashes,
-    length: usize,
-}
-
-impl TorrentInfo {
-    fn hash(&self) -> [u8; 20] {
-        let mut hasher = Sha1::new();
-        Digest::update(&mut hasher, serde_bencode::to_bytes(&self).unwrap());
-        hasher.finalize().try_into().unwrap()
-    }
-
-    fn encoded_hash(&self) -> String {
-        let hashed = self.hash();
-        let mut encoded = String::with_capacity(hashed.len() * 3);
-        for byte in hashed.iter() {
-            encoded.push('%');
-            encoded.push_str(hex::encode(&[*byte]).as_str());
-        }
-
-        encoded
-    }
 }
 
 fn decode_bencoded_value(encoded_value: String) -> anyhow::Result<serde_json::Value> {
