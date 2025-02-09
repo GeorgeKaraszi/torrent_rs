@@ -1,6 +1,7 @@
 use serde::de::{Deserialize, Deserializer};
 use serde::ser::{Serialize, Serializer};
 use sha1::{Digest, Sha1};
+use std::ops::{Deref, DerefMut};
 
 #[derive(serde::Deserialize, Debug)]
 pub struct Torrent {
@@ -36,6 +37,20 @@ impl TorrentInfo {
         }
 
         encoded
+    }
+}
+
+impl Deref for PiecesHashes {
+    type Target = Vec<[u8; 20]>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for PiecesHashes {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
