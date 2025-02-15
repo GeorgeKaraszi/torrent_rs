@@ -11,7 +11,7 @@ pub struct TackerRequest {
     pub compact: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[warn(dead_code)]
 pub struct TrackerResponse {
     #[serde(rename = "interval")]

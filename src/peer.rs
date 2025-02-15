@@ -1,14 +1,19 @@
-use anyhow::{anyhow, Error};
+use anyhow::{anyhow, ensure, Context, Error};
 use bytes::{Buf, BufMut, BytesMut};
+use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Deserializer};
 use std::net::{IpAddr, Ipv4Addr};
 use std::ops::{Deref, DerefMut};
-use tokio_util::codec::{Decoder, Encoder};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_util::codec::{Decoder, Encoder, Framed};
 
-#[derive(Debug)]
+const PEER_ID: &[u8; 20] = b"-PC0001-123456701112";
+
+#[derive(Debug, Clone)]
 pub struct Peers(Vec<Peer>);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Peer {
     pub ip: IpAddr,
     pub port: u16,
@@ -38,6 +43,11 @@ pub struct Piece<T: ?Sized = [u8]> {
     index: [u8; 4],
     begin: [u8; 4],
     block: T,
+}
+
+pub struct PeerConnection {
+    pub peer: Peer,
+    pub connection: Framed<TcpStream, PeerMessageCodec>,
 }
 
 #[repr(C)]
@@ -161,6 +171,63 @@ impl RequestMessage {
 impl Peer {
     pub fn ip_address(&self) -> String {
         format!("{}:{}", self.ip, self.port)
+    }
+}
+
+impl PeerConnection {
+    pub async fn connect(peer: Peer, info_hash: [u8; 20]) -> anyhow::Result<Self, Error> {
+        let mut connection = TcpStream::connect(peer.ip_address())
+            .await
+            .context("Failed to connect to peer")?;
+
+        let mut handshake = PeerHandshake::new(info_hash, *PEER_ID);
+
+        {
+            let handshake_bytes = handshake.mut_ptr();
+            connection
+                .write_all(handshake_bytes)
+                .await
+                .context("Write Handshake")?;
+            connection
+                .read_exact(handshake_bytes)
+                .await
+                .context("Read Handshake")?;
+        }
+
+        ensure!(handshake.protocol_length == 19);
+        ensure!(&handshake.protocol == b"BitTorrent protocol");
+        ensure!(&handshake.peer_id != PEER_ID);
+
+        let mut connection = Framed::new(connection, PeerMessageCodec);
+
+        let bitfield = connection
+            .next()
+            .await
+            .expect("peer always sends bitfields")
+            .context("peer message was invalid")?;
+
+        ensure!(bitfield.message_tag == MessageTag::Bitfield);
+
+        Ok(Self {
+            peer: peer,
+            connection: connection,
+        })
+    }
+
+    pub async fn send_interested(&mut self) -> anyhow::Result<(), Error> {
+        self.connection.send(PeerMessage::interested()).await?;
+
+        let unchoked = self
+            .connection
+            .next()
+            .await
+            .expect("peer responses with unchoked")
+            .context("peer message was invalid")?;
+
+        ensure!(unchoked.message_tag == MessageTag::Unchoke);
+        ensure!(unchoked.payload.is_empty());
+
+        Ok(())
     }
 }
 
@@ -292,7 +359,6 @@ impl Piece {
         if length < Self::PIECE_LEAD {
             return None;
         }
-
 
         let piece = &bytes[..length - Self::PIECE_LEAD] as *const [u8] as *const Self;
 

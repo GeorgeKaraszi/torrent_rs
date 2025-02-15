@@ -9,11 +9,9 @@ use sha1::{Digest, Sha1};
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_util::codec::Framed;
 
 const PEER_ID: &[u8; 20] = b"-PC0001-123456701112";
 const BLOCK_MAX: usize = 1 << 14;
-// const BLOCK_MAX: u32 = 16 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -39,14 +37,22 @@ enum Command {
     },
     #[command(name = "download_piece")]
     DownloadPiece(DownloadPiece),
+    Download(DownloadFile),
 }
 
-#[derive(clap::Args, Debug)] // `Args` is required to parse fields properly
+#[derive(clap::Args, Debug)]
 struct DownloadPiece {
     #[arg(short, long)] // Allows both `-o` and `--output`
     output: Option<PathBuf>,
     torrent: PathBuf,
     piece_index: usize,
+}
+
+#[derive(clap::Args, Debug)]
+struct DownloadFile {
+    #[arg(short, long)] // Allows both `-o` and `--output`
+    output: PathBuf,
+    torrent: PathBuf,
 }
 
 fn decode_bencoded_value(encoded_value: String) -> anyhow::Result<serde_json::Value> {
@@ -143,120 +149,136 @@ async fn download_peer_piece(
     torrent: Torrent,
     tracker_response: TrackerResponse,
     piece_index: usize,
-    output: PathBuf,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<u8>> {
     let peer = &tracker_response.peers[0];
-    let mut peer = TcpStream::connect(peer.ip_address())
-        .await
-        .context("failed to connect to peer")?;
+    let mut peer = PeerConnection::connect(peer.clone(), torrent.info.hash()).await?;
 
-    let mut handshake = PeerHandshake::new(torrent.info.hash(), *PEER_ID);
+    peer.send_interested().await?;
 
-    {
-        let handshake_bytes = handshake.mut_ptr();
-        peer.write_all(handshake_bytes)
-            .await
-            .context("Write Handshake")?;
-        peer.read_exact(handshake_bytes)
-            .await
-            .context("Read Handshake")?;
-    }
+    let piece_block = download_piece_block(peer, &torrent, vec![piece_index]).await?;
+    // Attempting to resist the urge to clone the data. Seems like it'd otherwise start being expensive long term.
+    let block = piece_block.into_iter().next().expect("block exists").1;
+    Ok(block)
+}
 
-    ensure!(handshake.protocol_length == 19);
-    ensure!(&handshake.protocol == b"BitTorrent protocol");
-    ensure!(&handshake.peer_id != PEER_ID);
+async fn download_piece_block(
+    mut peer: PeerConnection,
+    torrent: &Torrent,
+    piece_indexes: Vec<usize>,
+) -> anyhow::Result<Vec<(usize, Vec<u8>)>> {
+    let mut total_collection: Vec<(usize, Vec<u8>)> = Vec::with_capacity(piece_indexes.len());
 
-    let mut peer = Framed::new(peer, PeerMessageCodec);
-
-    let bitfield = peer
-        .next()
-        .await
-        .expect("peer always sends bitfields")
-        .context("peer message was invalid")?;
-
-    ensure!(bitfield.message_tag == MessageTag::Bitfield);
-
-    peer.send(PeerMessage::interested()).await?;
-
-    let unchoked = peer
-        .next()
-        .await
-        .expect("peer responses with unchoked")
-        .context("peer message was invalid")?;
-
-    ensure!(unchoked.message_tag == MessageTag::Unchoke);
-    ensure!(unchoked.payload.is_empty());
-
-    let piece_hash = torrent.info.pieces[piece_index];
-    let piece_size = if piece_index == torrent.info.pieces.len() - 1 {
-        let md = torrent.info.length % torrent.info.piece_length;
-        if md == 0 {
-            torrent.info.piece_length
-        } else {
-            md
-        }
-    } else {
-        torrent.info.piece_length
-    };
-
-    let num_of_blocks = (piece_size + (BLOCK_MAX - 1)) / BLOCK_MAX;
-    let mut block_collection: Vec<u8> = Vec::with_capacity(piece_size);
-
-    for block in 0..num_of_blocks {
-        let block_size = if block == num_of_blocks - 1 {
-            let md = piece_size % BLOCK_MAX;
+    for piece_index in piece_indexes {
+        let piece_hash = torrent.info.pieces[piece_index];
+        let piece_size = if piece_index == torrent.info.pieces.len() - 1 {
+            let md = torrent.info.length % torrent.info.piece_length;
             if md == 0 {
-                BLOCK_MAX
+                torrent.info.piece_length
             } else {
                 md
             }
         } else {
-            BLOCK_MAX
+            torrent.info.piece_length
         };
 
-        let mut request = RequestMessage::new(
-            piece_index as u32,
-            (block * BLOCK_MAX) as u32,
-            block_size as u32,
-        );
+        let num_of_blocks = (piece_size + (BLOCK_MAX - 1)) / BLOCK_MAX;
+        let mut block_collection: Vec<u8> = Vec::with_capacity(piece_size);
 
-        let request_message = PeerMessage::new(MessageTag::Request, Vec::from(request.mut_ptr()));
+        for block in 0..num_of_blocks {
+            let block_size = if block == num_of_blocks - 1 {
+                let md = piece_size % BLOCK_MAX;
+                if md == 0 {
+                    BLOCK_MAX
+                } else {
+                    md
+                }
+            } else {
+                BLOCK_MAX
+            };
 
-        peer.send(request_message)
-            .await
-            .with_context(|| format!("Sending request message {block}"))?;
+            let mut request = RequestMessage::new(
+                piece_index as u32,
+                (block * BLOCK_MAX) as u32,
+                block_size as u32,
+            );
 
-        let piece = peer
-            .next()
-            .await
-            .expect("Peer returns a piece")
-            .context("peer message was invalid")?;
+            let request_message =
+                PeerMessage::new(MessageTag::Request, Vec::from(request.mut_ptr()));
 
-        ensure!(piece.message_tag == MessageTag::Piece);
-        ensure!(!piece.payload.is_empty());
+            peer.connection
+                .send(request_message)
+                .await
+                .with_context(|| format!("Sending request message {block}"))?;
 
-        let piece = Piece::from_bytes(&piece.payload[..])
-            .expect("always returning pieces from the peers");
+            let piece = peer
+                .connection
+                .next()
+                .await
+                .expect("Peer returns a piece")
+                .context("peer message was invalid")?;
 
-        ensure!(piece.index() as usize == piece_index);
-        ensure!(piece.begin() as usize == block * BLOCK_MAX);
-        ensure!(piece.block().len() == block_size);
+            ensure!(piece.message_tag == MessageTag::Piece);
+            ensure!(!piece.payload.is_empty());
 
-        block_collection.extend(piece.block());
+            let piece = Piece::from_bytes(&piece.payload[..])
+                .expect("always returning pieces from the peers");
+
+            ensure!(piece.index() as usize == piece_index);
+            ensure!(piece.begin() as usize == block * BLOCK_MAX);
+            ensure!(piece.block().len() == block_size);
+
+            block_collection.extend(piece.block());
+        }
+
+        let mut hasher = Sha1::new();
+        hasher.update(&block_collection);
+        let hasher: [u8; 20] = hasher.finalize().try_into().expect("hashing failed");
+        ensure!(hasher == piece_hash);
+
+        total_collection.push((piece_index, block_collection));
     }
 
-    let mut hasher = Sha1::new();
-    hasher.update(&block_collection);
-    let hasher: [u8; 20] = hasher.finalize().try_into().expect("hashing failed");
-    ensure!(hasher == piece_hash);
+    Ok(total_collection)
+}
 
-    tokio::fs::write(&output, block_collection)
-        .await
-        .expect("writing block piece");
+async fn download_file(
+    torrent: Torrent,
+    tracker_response: TrackerResponse,
+) -> anyhow::Result<Vec<u8>> {
+    let peer_count = tracker_response.peers.len();
 
-    println!("Piece {piece_index} downloaded to: {}", output.display());
+    let mut async_pieces = vec![];
 
-    Ok(())
+    let info_hash = torrent.info.hash();
+    let mut peer_connections = vec![];
+
+    for peer in tracker_response.peers.iter() {
+        let mut peer_connection = PeerConnection::connect(peer.clone(), info_hash).await?;
+        peer_connection.send_interested().await?;
+        peer_connections.push((peer_connection, vec![]));
+    }
+
+    for (i, _hash) in torrent.info.pieces.iter().enumerate() {
+        peer_connections[i % peer_count].1.push(i);
+    }
+
+    for (peer_connection, pieces) in peer_connections {
+        let async_piece = download_piece_block(peer_connection, &torrent, pieces);
+        async_pieces.push(async_piece);
+    }
+
+    let block_pieces = futures::future::try_join_all(async_pieces).await?;
+    let mut organized_pieces: Vec<Vec<u8>> = vec![vec![]; torrent.info.pieces.len()];
+
+    for peer_blocks in block_pieces {
+        for (index, block) in peer_blocks {
+            organized_pieces[index] = block;
+        }
+    }
+
+    let collected_pieces = organized_pieces.into_iter().flat_map(|v| v).collect();
+
+    Ok(collected_pieces)
 }
 
 #[tokio::main]
@@ -289,16 +311,34 @@ async fn main() -> anyhow::Result<()> {
             handshake_from_peer(torrent.info.hash(), peer).await?;
         }
         Command::DownloadPiece(download_piece) => {
-            println!("{:?}", download_piece);
+            let output = download_piece.output.unwrap();
             let torrent = read_torrent_file(download_piece.torrent)?;
             let torrent_response = fetch_tracker_info(&torrent).await?;
-            download_peer_piece(
-                torrent,
-                torrent_response,
+            let piece_block_data =
+                download_peer_piece(torrent, torrent_response, download_piece.piece_index).await?;
+
+            tokio::fs::write(output.clone(), piece_block_data)
+                .await
+                .expect("writing block piece");
+
+            println!(
+                "Piece {} downloaded to: {}",
                 download_piece.piece_index,
-                download_piece.output.unwrap(),
-            )
-            .await?;
+                output.display()
+            );
+        }
+        Command::Download(download_file_opts) => {
+            println!("Download: {:#?}", download_file_opts);
+            let output = download_file_opts.output;
+            let torrent = read_torrent_file(download_file_opts.torrent)?;
+            let torrent_response = fetch_tracker_info(&torrent).await?;
+            let raw_file_data = download_file(torrent, torrent_response).await?;
+
+            tokio::fs::write(output.clone(), raw_file_data)
+                .await
+                .expect("writing file");
+
+            println!("downloaded to: {}", output.display());
         }
     }
 

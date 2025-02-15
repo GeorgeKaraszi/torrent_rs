@@ -3,13 +3,13 @@ use serde::ser::{Serialize, Serializer};
 use sha1::{Digest, Sha1};
 use std::ops::{Deref, DerefMut};
 
-#[derive(serde::Deserialize, Debug)]
+#[derive(serde::Deserialize, Debug, Clone)]
 pub struct Torrent {
     pub announce: String,
     pub info: TorrentInfo,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct TorrentInfo {
     pub name: String,
     #[serde(rename = "piece length")]
@@ -18,7 +18,7 @@ pub struct TorrentInfo {
     pub length: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PiecesHashes(Vec<[u8; 20]>);
 
 impl TorrentInfo {
