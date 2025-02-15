@@ -1,18 +1,24 @@
+// ----------------- IMPORTS -----------------
 use anyhow::{anyhow, ensure, Context, Error};
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Deserializer};
 use std::fmt;
+use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr};
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
+// ----------------- CONSTANTS & TYPE ALIASES -----------------
 pub type HashType = [u8; 20];
 pub type PeerId = [u8; 20];
 pub const PEER_ID: &PeerId = b"-PC0001-123456701112";
+const HANDSHAKE_LENGTH: usize = size_of::<PeerHandshake>(); // 68
+const MAX_MESSAGE_LENGTH: usize = 1 << 16;
 
+// ----------------- CORE PEER STRUCTS -----------------
 #[derive(Debug, Clone)]
 pub struct Peers(Vec<Peer>);
 
@@ -22,6 +28,13 @@ pub struct Peer {
     pub port: u16,
 }
 
+#[derive(Clone)]
+pub struct PeerConnection {
+    pub peer: Peer,
+    pub connection: Arc<Mutex<Framed<TcpStream, PeerCodec>>>,
+}
+
+// ----------------- NETWORKING & PROTOCOL -----------------
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct PeerHandshake {
@@ -30,6 +43,13 @@ pub struct PeerHandshake {
     pub reserved: [u8; 8],
     pub info_hash: HashType,
     pub peer_id: PeerId,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct PeerMessage {
+    pub message_tag: MessageTag,
+    pub payload: Vec<u8>,
 }
 
 #[repr(C)]
@@ -48,17 +68,9 @@ pub struct Piece<T: ?Sized = [u8]> {
     block: T,
 }
 
-#[derive(Clone)]
-pub struct PeerConnection {
-    pub peer: Peer,
-    pub connection: Arc<Mutex<Framed<TcpStream, PeerCodec>>>,
-}
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct PeerMessage {
-    pub message_tag: MessageTag,
-    pub payload: Vec<u8>,
+// ----------------- ENCODING & DECODING -----------------
+pub struct PeerCodec {
+    pub state: CodecState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,226 +94,46 @@ pub enum PeerFrame {
     Message(PeerMessage),
 }
 
-impl PeerFrame {
-    pub fn expect_handshake(self) -> PeerHandshake {
-        match self {
-            PeerFrame::Handshake(handshake) => handshake,
-            _ => panic!("Called `unwrap_handshake()` on a `Message` variant"),
-        }
-    }
-
-    pub fn expect_message(self) -> PeerMessage {
-        match self {
-            PeerFrame::Message(message) => message,
-            _ => panic!("Called `unwrap_message()` on a `Handshake` variant"),
-        }
-    }
-
-    pub fn as_message(&self) -> Option<&PeerMessage> {
-        match self {
-            PeerFrame::Message(message) => Some(message),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, PartialEq)]
 pub enum CodecState {
     WaitingHandshake,
     Messages,
 }
 
-pub struct PeerCodec {
-    pub state: CodecState,
-}
+// Implementations
 
-impl PeerCodec {
-    pub fn new() -> Self {
-        Self {
-            state: CodecState::WaitingHandshake,
-        }
+impl Deref for Peers {
+    type Target = Vec<Peer>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
-const HANDSHAKE_LENGTH: usize = size_of::<PeerHandshake>(); // 68
-const MAX_MESSAGE_LENGTH: usize = 1 << 16;
-impl Decoder for PeerCodec {
-    type Item = PeerFrame;
-    type Error = Error;
+impl<'de> Deserialize<'de> for Peers {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes: Vec<u8> = serde_bytes::deserialize(deserializer)?;
 
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        match self.state {
-            CodecState::WaitingHandshake => {
-                if src.len() < HANDSHAKE_LENGTH {
-                    return Ok(None);
-                }
-
-                let mut peer_handshake = PeerHandshake::new_peer();
-                peer_handshake
-                    .mut_ptr()
-                    .copy_from_slice(&src[..HANDSHAKE_LENGTH]);
-                src.advance(HANDSHAKE_LENGTH);
-
-                self.state = CodecState::Messages;
-                Ok(Some(PeerFrame::Handshake(peer_handshake)))
-            }
-
-            CodecState::Messages => {
-                if src.len() < 4 {
-                    return Ok(None);
-                }
-
-                let mut length_bytes = [0u8; 4];
-                length_bytes.copy_from_slice(&src[..4]);
-                let length = u32::from_be_bytes(length_bytes) as usize;
-
-                if length == 0 {
-                    src.advance(4);
-                    return Ok(None);
-                }
-
-                if src.len() < 5 {
-                    return Ok(None);
-                }
-
-                if length > MAX_MESSAGE_LENGTH {
-                    return Err(anyhow!("Frame of length {} is too large", length));
-                }
-
-                if src.len() < 4 + length {
-                    src.reserve(4 + length - src.len());
-                    return Ok(None);
-                }
-
-                let message_tag = match src[4] {
-                    0 => MessageTag::Choke,
-                    1 => MessageTag::Unchoke,
-                    2 => MessageTag::Interested,
-                    3 => MessageTag::NotInterested,
-                    4 => MessageTag::Have,
-                    5 => MessageTag::Bitfield,
-                    6 => MessageTag::Request,
-                    7 => MessageTag::Piece,
-                    8 => MessageTag::Cancel,
-                    tag => {
-                        return Err(anyhow!("Unknown message tag id: {}", tag));
-                    }
-                };
-
-                let message_payload = if src.len() > 5 {
-                    src[5..4 + length].to_vec()
-                } else {
-                    Vec::new()
-                };
-
-                src.advance(4 + length);
-
-                Ok(Some(PeerFrame::Message(PeerMessage::new(
-                    message_tag,
-                    message_payload,
-                ))))
-            }
+        if bytes.len() % 6 != 0 {
+            return Err(serde::de::Error::custom(
+                "invalid Peer length. Must be multiple of 6.",
+            ));
         }
 
-        // if src.len() < 4 {
-        //     return Ok(None);
-        // }
-        //
-        // let mut length_bytes = [0u8; 4];
-        // length_bytes.copy_from_slice(&src[..4]);
-        // let length = u32::from_be_bytes(length_bytes) as usize;
-        //
-        // if length == 0 {
-        //     src.advance(4);
-        //     return Ok(None);
-        // }
-        //
-        // if src.len() < 5 {
-        //     return Ok(None);
-        // }
-        //
-        // if length > MAX {
-        //     return Err(Error::from(std::io::Error::new(
-        //         std::io::ErrorKind::InvalidData,
-        //         format!("Frame of length {} is too large", length),
-        //     )));
-        // }
-        //
-        // if src.len() < 4 + length {
-        //     src.reserve(4 + length - src.len());
-        //     return Ok(None);
-        // }
-        //
-        // let message_tag = match src[4] {
-        //     0 => MessageTag::Choke,
-        //     1 => MessageTag::Unchoke,
-        //     2 => MessageTag::Interested,
-        //     3 => MessageTag::NotInterested,
-        //     4 => MessageTag::Have,
-        //     5 => MessageTag::Bitfield,
-        //     6 => MessageTag::Request,
-        //     7 => MessageTag::Piece,
-        //     8 => MessageTag::Cancel,
-        //     tag => {
-        //         return Err(anyhow!("Unknown message tag id: {}", tag));
-        //     }
-        // };
-        //
-        // let message_payload = if src.len() > 5 {
-        //     src[5..4 + length].to_vec()
-        // } else {
-        //     Vec::new()
-        // };
-        //
-        // // let message_payload: Vec<u8> = match src.get(..=message_length) {
-        // //     Some(payload) => payload.to_vec(),
-        // //     None => Vec::new(),
-        // // };
-        //
-        // src.advance(4 + length);
-        //
-        // Ok(Some(PeerMessage::new(message_tag, message_payload)))
-    }
-}
+        let mut peers = Vec::new();
+        for chunk in bytes.chunks(6) {
+            let ip: [u8; 4] = chunk.get(0..4).unwrap().try_into().unwrap();
+            let port: [u8; 2] = chunk.get(4..6).unwrap().try_into().unwrap();
 
-impl Encoder<PeerFrame> for PeerCodec {
-    type Error = Error;
+            let ip = IpAddr::V4(Ipv4Addr::from(ip));
+            let port = u16::from_be_bytes(port);
 
-    fn encode(&mut self, item: PeerFrame, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        match item {
-            PeerFrame::Handshake(handshake) => {
-                let bytes = unsafe {
-                    let ptr = &handshake as *const PeerHandshake as *const u8;
-                    std::slice::from_raw_parts(ptr, HANDSHAKE_LENGTH)
-                };
-                dst.reserve(HANDSHAKE_LENGTH);
-                dst.put_slice(bytes);
-                Ok(())
-            }
-            PeerFrame::Message(msg) => {
-                let message_length: [u8; 4] = u32::to_be_bytes(msg.payload.len() as u32 + 1);
-                dst.put_slice(&message_length);
-                dst.put_u8(msg.message_tag as u8);
-                dst.put_slice(&msg.payload);
-                Ok(())
-            }
+            peers.push(Peer { ip, port });
         }
-    }
-}
-
-impl RequestMessage {
-    pub fn new(index: u32, begin: u32, length: u32) -> Self {
-        Self {
-            index: index.to_be_bytes(),
-            begin: begin.to_be_bytes(),
-            length: length.to_be_bytes(),
-        }
-    }
-    pub fn mut_ptr(&mut self) -> &mut [u8; size_of::<Self>()] {
-        let bytes = self as *mut Self as *mut [u8; size_of::<Self>()];
-        let bytes: &mut [u8; size_of::<Self>()] = unsafe { &mut *bytes };
-
-        bytes
+        Ok(Self(peers))
     }
 }
 
@@ -411,44 +243,139 @@ impl PeerMessage {
     }
 }
 
-impl Deref for Peers {
-    type Target = Vec<Peer>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
+impl PeerCodec {
+    pub fn new() -> Self {
+        Self {
+            state: CodecState::WaitingHandshake,
+        }
     }
 }
 
-impl DerefMut for Peers {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+impl Decoder for PeerCodec {
+    type Item = PeerFrame;
+    type Error = Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        match self.state {
+            CodecState::WaitingHandshake => {
+                if src.len() < HANDSHAKE_LENGTH {
+                    return Ok(None);
+                }
+
+                let mut peer_handshake = PeerHandshake::new_peer();
+                peer_handshake
+                    .mut_ptr()
+                    .copy_from_slice(&src[..HANDSHAKE_LENGTH]);
+                src.advance(HANDSHAKE_LENGTH);
+
+                self.state = CodecState::Messages;
+                Ok(Some(PeerFrame::Handshake(peer_handshake)))
+            }
+
+            CodecState::Messages => {
+                if src.len() < 4 {
+                    return Ok(None);
+                }
+
+                let mut length_bytes = [0u8; 4];
+                length_bytes.copy_from_slice(&src[..4]);
+                let length = u32::from_be_bytes(length_bytes) as usize;
+
+                if length == 0 {
+                    src.advance(4);
+                    return Ok(None);
+                }
+
+                if src.len() < 5 {
+                    return Ok(None);
+                }
+
+                if length > MAX_MESSAGE_LENGTH {
+                    return Err(anyhow!("Frame of length {} is too large", length));
+                }
+
+                if src.len() < 4 + length {
+                    src.reserve(4 + length - src.len());
+                    return Ok(None);
+                }
+
+                let message_tag = match src[4] {
+                    0 => MessageTag::Choke,
+                    1 => MessageTag::Unchoke,
+                    2 => MessageTag::Interested,
+                    3 => MessageTag::NotInterested,
+                    4 => MessageTag::Have,
+                    5 => MessageTag::Bitfield,
+                    6 => MessageTag::Request,
+                    7 => MessageTag::Piece,
+                    8 => MessageTag::Cancel,
+                    tag => {
+                        return Err(anyhow!("Unknown message tag id: {}", tag));
+                    }
+                };
+
+                let message_payload = if src.len() > 5 {
+                    src[5..4 + length].to_vec()
+                } else {
+                    Vec::new()
+                };
+
+                src.advance(4 + length);
+
+                Ok(Some(PeerFrame::Message(PeerMessage::new(
+                    message_tag,
+                    message_payload,
+                ))))
+            }
+        }
     }
 }
 
-impl<'de> Deserialize<'de> for Peers {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let bytes: Vec<u8> = serde_bytes::deserialize(deserializer)?;
+impl Encoder<PeerFrame> for PeerCodec {
+    type Error = Error;
 
-        if bytes.len() % 6 != 0 {
-            return Err(serde::de::Error::custom(
-                "invalid Peer length. Must be multiple of 6.",
-            ));
+    fn encode(&mut self, item: PeerFrame, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        match item {
+            PeerFrame::Handshake(handshake) => {
+                let bytes = unsafe {
+                    let ptr = &handshake as *const PeerHandshake as *const u8;
+                    std::slice::from_raw_parts(ptr, HANDSHAKE_LENGTH)
+                };
+                dst.reserve(HANDSHAKE_LENGTH);
+                dst.put_slice(bytes);
+                Ok(())
+            }
+            PeerFrame::Message(msg) => {
+                let message_length: [u8; 4] = u32::to_be_bytes(msg.payload.len() as u32 + 1);
+                dst.put_slice(&message_length);
+                dst.put_u8(msg.message_tag as u8);
+                dst.put_slice(&msg.payload);
+                Ok(())
+            }
         }
+    }
+}
 
-        let mut peers = Vec::new();
-        for chunk in bytes.chunks(6) {
-            let ip: [u8; 4] = chunk.get(0..4).unwrap().try_into().unwrap();
-            let port: [u8; 2] = chunk.get(4..6).unwrap().try_into().unwrap();
-
-            let ip = IpAddr::V4(Ipv4Addr::from(ip));
-            let port = u16::from_be_bytes(port);
-
-            peers.push(Peer { ip, port });
+impl PeerFrame {
+    pub fn expect_handshake(self) -> PeerHandshake {
+        match self {
+            PeerFrame::Handshake(handshake) => handshake,
+            _ => panic!("Called `unwrap_handshake()` on a `Message` variant"),
         }
-        Ok(Self(peers))
+    }
+
+    pub fn expect_message(self) -> PeerMessage {
+        match self {
+            PeerFrame::Message(message) => message,
+            _ => panic!("Called `unwrap_message()` on a `Handshake` variant"),
+        }
+    }
+
+    pub fn as_message(&self) -> Option<&PeerMessage> {
+        match self {
+            PeerFrame::Message(message) => Some(message),
+            _ => None,
+        }
     }
 }
 
@@ -474,6 +401,22 @@ impl PeerHandshake {
         Self::default(None, None)
     }
 
+    pub fn mut_ptr(&mut self) -> &mut [u8; size_of::<Self>()] {
+        let bytes = self as *mut Self as *mut [u8; size_of::<Self>()];
+        let bytes: &mut [u8; size_of::<Self>()] = unsafe { &mut *bytes };
+
+        bytes
+    }
+}
+
+impl RequestMessage {
+    pub fn new(index: u32, begin: u32, length: u32) -> Self {
+        Self {
+            index: index.to_be_bytes(),
+            begin: begin.to_be_bytes(),
+            length: length.to_be_bytes(),
+        }
+    }
     pub fn mut_ptr(&mut self) -> &mut [u8; size_of::<Self>()] {
         let bytes = self as *mut Self as *mut [u8; size_of::<Self>()];
         let bytes: &mut [u8; size_of::<Self>()] = unsafe { &mut *bytes };
