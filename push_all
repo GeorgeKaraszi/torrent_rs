@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# Push main branch to origin
-git push origin master
-
 # Push develop branch to upstream
 git push upstream main
+
+# Push main branch to origin
+git push origin master
 
 echo "Pushed master to origin and main to upstream."
