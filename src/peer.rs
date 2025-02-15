@@ -11,7 +11,7 @@ use tokio_util::codec::{Decoder, Encoder, Framed};
 
 pub type HashType = [u8; 20];
 pub type PeerId = [u8; 20];
-const PEER_ID: &PeerId = b"-PC0001-123456701112";
+pub const PEER_ID: &PeerId = b"-PC0001-123456701112";
 
 #[derive(Debug, Clone)]
 pub struct Peers(Vec<Peer>);

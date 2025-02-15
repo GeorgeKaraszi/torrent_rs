@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-const PEER_ID: &[u8; 20] = b"-PC0001-123456701112";
 const BLOCK_MAX: usize = 1 << 14;
 
 #[derive(Parser, Debug)]
