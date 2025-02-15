@@ -3,6 +3,8 @@ use serde::ser::{Serialize, Serializer};
 use sha1::{Digest, Sha1};
 use std::ops::{Deref, DerefMut};
 
+pub type HashType = [u8; 20];
+
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Torrent {
     pub announce: String,
@@ -19,10 +21,10 @@ pub struct TorrentInfo {
 }
 
 #[derive(Debug, Clone)]
-pub struct PiecesHashes(Vec<[u8; 20]>);
+pub struct PiecesHashes(Vec<HashType>);
 
 impl TorrentInfo {
-    pub fn hash(&self) -> [u8; 20] {
+    pub fn hash(&self) -> HashType {
         let mut hasher = Sha1::new();
         Digest::update(&mut hasher, serde_bencode::to_bytes(&self).unwrap());
         hasher.finalize().try_into().unwrap()
