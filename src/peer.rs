@@ -380,25 +380,35 @@ impl PeerFrame {
 }
 
 impl PeerHandshake {
-    pub fn default(info_hash: Option<HashType>, peer_id: Option<PeerId>) -> Self {
+    pub fn default(
+        info_hash: Option<HashType>,
+        peer_id: Option<PeerId>,
+        extension: Option<[u8; 8]>,
+    ) -> Self {
         let peer_id = peer_id.unwrap_or(*PEER_ID);
         let info_hash = info_hash.unwrap_or([0u8; 20]);
+        let reserved = extension.unwrap_or([0u8; 8]);
 
         Self {
             protocol_length: 19,
             protocol: *b"BitTorrent protocol",
-            reserved: [0; 8],
+            reserved: reserved,
             info_hash: info_hash,
             peer_id: peer_id,
         }
     }
 
     pub fn new(info_hash: HashType) -> Self {
-        Self::default(Some(info_hash), None)
+        Self::default(Some(info_hash), None, None)
+    }
+
+    pub fn new_ext(info_hash: HashType) -> Self {
+        let magnet_ext = (1u64 << 20).to_be_bytes().into();
+        Self::default(Some(info_hash), None, Some(magnet_ext))
     }
 
     pub fn new_peer() -> Self {
-        Self::default(None, None)
+        Self::default(None, None, None)
     }
 
     pub fn mut_ptr(&mut self) -> &mut [u8; size_of::<Self>()] {

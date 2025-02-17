@@ -8,13 +8,13 @@ use std::ops::Deref;
 pub struct Magnet {
     pub name: Option<String>,
     pub info_hash: HashType,
-    pub tracker: Option<String>,
+    pub announce: Option<String>,
 }
 
 impl Magnet {
     pub fn from_str(magnet: &str) -> Result<Self, Error> {
         let mut info_hash = None;
-        let mut tracker: Option<String> = None;
+        let mut announce: Option<String> = None;
         let mut name: Option<String> = None;
 
         let url = Url::parse(magnet)?;
@@ -33,7 +33,7 @@ impl Magnet {
                     name = Some(value.into_owned());
                 }
                 "tr" => {
-                    tracker = Some(value.into_owned());
+                    announce = Some(value.into_owned());
                 }
                 _ => {}
             }
@@ -42,7 +42,21 @@ impl Magnet {
         Ok(Self {
             name: name,
             info_hash: info_hash.expect("no hash found"),
-            tracker: tracker,
+            announce: announce,
         })
+    }
+
+    pub fn announce(&self) -> &str {
+        self.announce.as_ref().expect("invalid tracker url").as_str()
+    }
+
+    pub fn encoded_hash(&self) -> String {
+        let mut encoded = String::with_capacity(self.info_hash.len() * 3);
+        for byte in self.info_hash.iter() {
+            encoded.push('%');
+            encoded.push_str(hex::encode(&[*byte]).as_str());
+        }
+
+        encoded
     }
 }

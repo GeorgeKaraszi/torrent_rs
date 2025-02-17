@@ -43,6 +43,10 @@ enum Command {
     MagnetParse {
         magnet: String,
     },
+    #[command(name = "magnet_handshake")]
+    MagnetHandshake {
+        magnet: String,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -284,6 +288,60 @@ async fn download_file(torrent: Torrent, tracker: TrackerResponse) -> anyhow::Re
     Ok(collected_pieces)
 }
 
+async fn fetch_magnet_tracker_info(magnet: Magnet) -> Result<TrackerResponse, Error> {
+    let req = TackerRequest {
+        peer_id: std::str::from_utf8(PEER_ID)?.to_string(),
+        port: 6881,
+        uploaded: 0,
+        downloaded: 0,
+        left: 1,
+        compact: 1,
+    };
+
+    let params = serde_urlencoded::to_string(&req)?;
+
+    let info_hash = magnet.encoded_hash();
+    let url = format!("{}?{}&info_hash={}", magnet.announce(), params, info_hash);
+
+    let response = reqwest::get(url).await.expect("Fetching tracker info");
+    let response = response.bytes().await.expect("Reading response");
+    let response = serde_bencode::from_bytes::<TrackerResponse>(&response)?;
+
+    Ok(response)
+}
+
+async fn handshake_from_peer_v2(
+    tracker_response: TrackerResponse,
+    magnet: Magnet,
+) -> Result<(), Error> {
+    let mut connection = TcpStream::connect(tracker_response.peers[0].ip_address())
+        .await
+        .expect("Handshake failed");
+
+    let mut handshake = PeerHandshake::new_ext(magnet.info_hash);
+
+    {
+        let handshake_bytes = handshake.mut_ptr();
+
+        connection
+            .write_all(handshake_bytes)
+            .await
+            .context("Write Handshake")?;
+
+        connection
+            .read_exact(handshake_bytes)
+            .await
+            .context("Read Handshake")?;
+    }
+
+    ensure!(handshake.protocol_length == 19);
+    ensure!(&handshake.protocol == b"BitTorrent protocol");
+    ensure!(&handshake.peer_id != PEER_ID);
+
+    println!("Peer ID: {}", hex::encode(handshake.peer_id));
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -345,8 +403,13 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::MagnetParse { magnet } => {
             let magnet = Magnet::from_str(magnet.as_str())?;
-            println!("Tracker URL: {}", magnet.tracker.unwrap_or("".to_string()));
+            println!("Tracker URL: {}", magnet.announce());
             println!("Info Hash: {}", hex::encode(magnet.info_hash))
+        }
+        Command::MagnetHandshake { magnet } => {
+            let magnet = Magnet::from_str(magnet.as_str())?;
+            let tracker_response = fetch_magnet_tracker_info(magnet.clone()).await?;
+            handshake_from_peer_v2(tracker_response, magnet).await?
         }
     }
 
