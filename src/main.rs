@@ -117,13 +117,18 @@ async fn fetch_tracker_info(torrent: &Torrent) -> anyhow::Result<TrackerResponse
 
 async fn handshake_from_peer(
     info_hash: [u8; 20],
+    extension: bool,
     peer: String,
 ) -> anyhow::Result<PeerHandshake, Error> {
     let mut connection = TcpStream::connect(peer)
         .await
         .expect("Failed to connect to peer");
 
-    let mut handshake = PeerHandshake::new(info_hash);
+    let mut handshake = if extension {
+        PeerHandshake::new_ext(info_hash)
+    } else {
+        PeerHandshake::new(info_hash)
+    };
 
     {
         let handshake_bytes = handshake.mut_ptr();
@@ -310,38 +315,6 @@ async fn fetch_magnet_tracker_info(magnet: Magnet) -> Result<TrackerResponse, Er
     Ok(response)
 }
 
-async fn handshake_from_peer_v2(
-    tracker_response: TrackerResponse,
-    magnet: Magnet,
-) -> Result<(), Error> {
-    let mut connection = TcpStream::connect(tracker_response.peers[0].ip_address())
-        .await
-        .expect("Handshake failed");
-
-    let mut handshake = PeerHandshake::new_ext(magnet.info_hash);
-
-    {
-        let handshake_bytes = handshake.mut_ptr();
-
-        connection
-            .write_all(handshake_bytes)
-            .await
-            .context("Write Handshake")?;
-
-        connection
-            .read_exact(handshake_bytes)
-            .await
-            .context("Read Handshake")?;
-    }
-
-    ensure!(handshake.protocol_length == 19);
-    ensure!(&handshake.protocol == b"BitTorrent protocol");
-    ensure!(&handshake.peer_id != PEER_ID);
-
-    println!("Peer ID: {}", hex::encode(handshake.peer_id));
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -369,7 +342,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Handshake { torrent, peer } => {
             let torrent = read_torrent_file(torrent)?;
-            handshake_from_peer(torrent.info.hash(), peer).await?;
+            handshake_from_peer(torrent.info.hash(), false, peer).await?;
         }
         Command::DownloadPiece(download_piece) => {
             let output = download_piece.output.unwrap();
@@ -409,7 +382,8 @@ async fn main() -> anyhow::Result<()> {
         Command::MagnetHandshake { magnet } => {
             let magnet = Magnet::from_str(magnet.as_str())?;
             let tracker_response = fetch_magnet_tracker_info(magnet.clone()).await?;
-            handshake_from_peer_v2(tracker_response, magnet).await?
+            let peer = tracker_response.peers[0].ip_address();
+            handshake_from_peer(magnet.info_hash, true, peer).await?;
         }
     }
 
