@@ -1,5 +1,6 @@
 use anyhow::{ensure, Context, Error};
 use clap::{Parser, Subcommand};
+use codecrafters_bittorrent::magnet::*;
 use codecrafters_bittorrent::peer::*;
 use codecrafters_bittorrent::torrent::{Torrent, TorrentInfo};
 use codecrafters_bittorrent::tracker::{TackerRequest, TrackerResponse};
@@ -38,6 +39,10 @@ enum Command {
     #[command(name = "download_piece")]
     DownloadPiece(DownloadPiece),
     Download(DownloadFile),
+    #[command(name = "magnet_parse")]
+    MagnetParse {
+        magnet: String,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -337,6 +342,11 @@ async fn main() -> anyhow::Result<()> {
                 .expect("writing file");
 
             println!("downloaded to: {}", output.display());
+        }
+        Command::MagnetParse { magnet } => {
+            let magnet = Magnet::from_str(magnet.as_str())?;
+            println!("Tracker URL: {}", magnet.tracker.unwrap_or("".to_string()));
+            println!("Info Hash: {}", hex::encode(magnet.info_hash))
         }
     }
 
