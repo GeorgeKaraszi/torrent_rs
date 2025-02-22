@@ -2,8 +2,7 @@ use serde::de::{Deserialize, Deserializer};
 use serde::ser::{Serialize, Serializer};
 use sha1::{Digest, Sha1};
 use std::ops::{Deref, DerefMut};
-
-pub type HashType = [u8; 20];
+use crate::types::HashId;
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Torrent {
@@ -21,10 +20,10 @@ pub struct TorrentInfo {
 }
 
 #[derive(Debug, Clone)]
-pub struct PiecesHashes(Vec<HashType>);
+pub struct PiecesHashes(Vec<HashId>);
 
 impl TorrentInfo {
-    pub fn hash(&self) -> HashType {
+    pub fn hash(&self) -> HashId {
         let mut hasher = Sha1::new();
         Digest::update(&mut hasher, serde_bencode::to_bytes(&self).unwrap());
         hasher.finalize().try_into().unwrap()
@@ -43,7 +42,7 @@ impl TorrentInfo {
 }
 
 impl Deref for PiecesHashes {
-    type Target = Vec<[u8; 20]>;
+    type Target = Vec<HashId>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -57,7 +56,7 @@ impl DerefMut for PiecesHashes {
 }
 
 impl PiecesHashes {
-    pub fn iter(&self) -> impl Iterator<Item = &[u8; 20]> {
+    pub fn iter(&self) -> impl Iterator<Item = &HashId> {
         self.0.iter()
     }
 
@@ -86,7 +85,7 @@ impl<'de> Deserialize<'de> for PiecesHashes {
 
         let mut hashes = Vec::new();
         for chunk in bytes.chunks(20) {
-            let mut hash = [0u8; 20];
+            let mut hash = HashId::default();
             hash.copy_from_slice(chunk);
             hashes.push(hash);
         }

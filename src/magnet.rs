@@ -1,14 +1,16 @@
-use crate::peer::HashType;
+use crate::peer::{PeerConnection, PeerHandshake};
+use crate::tracker::Tracker;
+use crate::types::{HashId, PeerId};
 use anyhow::{anyhow, Error, Result};
-use hex::FromHex;
 use reqwest::Url;
 use std::ops::Deref;
 
 #[derive(Debug, Clone)]
 pub struct Magnet {
     pub name: Option<String>,
-    pub info_hash: HashType,
+    pub info_hash: HashId,
     pub announce: Option<String>,
+    tracker: Option<Tracker>,
 }
 
 impl Magnet {
@@ -23,7 +25,7 @@ impl Magnet {
             match query_name.deref() {
                 "xt" => match value.deref().strip_prefix("urn:btih:") {
                     Some(info_hash_hex) => {
-                        info_hash = Some(HashType::from_hex(info_hash_hex)?);
+                        info_hash = Some(HashId::from_hex(info_hash_hex)?);
                     }
                     None => {
                         return Err(anyhow!("invalid info hash"));
@@ -43,20 +45,44 @@ impl Magnet {
             name: name,
             info_hash: info_hash.expect("no hash found"),
             announce: announce,
+            tracker: None,
         })
     }
 
     pub fn announce(&self) -> &str {
-        self.announce.as_ref().expect("invalid tracker url").as_str()
+        self.announce
+            .as_ref()
+            .expect("invalid tracker url")
+            .as_str()
     }
 
-    pub fn encoded_hash(&self) -> String {
-        let mut encoded = String::with_capacity(self.info_hash.len() * 3);
-        for byte in self.info_hash.iter() {
-            encoded.push('%');
-            encoded.push_str(hex::encode(&[*byte]).as_str());
+    pub fn tracker(&self) -> &Tracker {
+        match self.tracker {
+            Some(ref tracker) => tracker,
+            None => panic!("tracker not found, you must call discover_peers first"),
+        }
+    }
+
+    pub async fn discover_peers(&mut self, peer_id: &PeerId) -> Result<&Tracker, Error> {
+        if self.tracker.is_none() {
+            self.tracker = Tracker::discover_peers(peer_id, self.announce(), self.info_hash, 20)
+                .await
+                .ok();
         }
 
-        encoded
+        Ok(self.tracker())
+    }
+
+    pub async fn handshake(&mut self, peer_id: &PeerId) -> Result<PeerHandshake, Error> {
+        let tracker = self.discover_peers(peer_id).await?;
+
+        let mut peer = PeerConnection::connect(tracker.peers[0].clone()).await?;
+        let peer_handshake = peer.send_handshake(self.info_hash, true).await?;
+        let peer_extension = peer.send_extension().await?;
+
+        println!("Peer ID: {}", hex::encode(peer_handshake.peer_id));
+        println!("Extension: {:#?}", peer_extension);
+
+        Ok(peer_handshake)
     }
 }

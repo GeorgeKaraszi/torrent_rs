@@ -3,9 +3,10 @@ use clap::{Parser, Subcommand};
 use codecrafters_bittorrent::magnet::*;
 use codecrafters_bittorrent::peer::*;
 use codecrafters_bittorrent::torrent::{Torrent, TorrentInfo};
-use codecrafters_bittorrent::tracker::{TackerRequest, TrackerResponse};
+use codecrafters_bittorrent::tracker::{TackerRequest, Tracker};
+use codecrafters_bittorrent::{convert, PEER_ID};
+use codecrafters_bittorrent::types::{HashId};
 use futures::{SinkExt, StreamExt};
-use serde_json;
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -64,36 +65,7 @@ struct DownloadFile {
     torrent: PathBuf,
 }
 
-fn decode_bencoded_value(encoded_value: String) -> anyhow::Result<serde_json::Value> {
-    let value: serde_bencode::value::Value = serde_bencode::from_str(encoded_value.as_str())?;
-    convert(value)
-}
-
-fn convert(value: serde_bencode::value::Value) -> anyhow::Result<serde_json::Value> {
-    match value {
-        serde_bencode::value::Value::Int(n) => Ok(n.into()),
-        serde_bencode::value::Value::Bytes(s) => Ok(String::from_utf8(s)?.to_string().into()),
-        serde_bencode::value::Value::List(list) => {
-            let mut vec = vec![];
-            for value in list {
-                vec.push(convert(value)?);
-            }
-            Ok(vec.into())
-        }
-        serde_bencode::value::Value::Dict(dict) => {
-            let mut dictionary = serde_json::Map::new();
-            for (key, value) in dict {
-                let key = String::from_utf8(key)?;
-                let value = convert(value)?;
-                dictionary.insert(key, value);
-            }
-
-            Ok(dictionary.into())
-        }
-    }
-}
-
-async fn fetch_tracker_info(torrent: &Torrent) -> anyhow::Result<TrackerResponse> {
+async fn fetch_tracker_info(torrent: &Torrent) -> anyhow::Result<Tracker> {
     let req = TackerRequest {
         peer_id: std::str::from_utf8(PEER_ID)?.to_string(),
         port: 6881,
@@ -110,25 +82,20 @@ async fn fetch_tracker_info(torrent: &Torrent) -> anyhow::Result<TrackerResponse
 
     let response = reqwest::get(url).await.expect("Fetching tracker info");
     let response = response.bytes().await.expect("Reading response");
-    let response = serde_bencode::from_bytes::<TrackerResponse>(&response)?;
+    let response = serde_bencode::from_bytes::<Tracker>(&response)?;
 
     Ok(response)
 }
 
 async fn handshake_from_peer(
-    info_hash: [u8; 20],
-    extension: bool,
+    info_hash: HashId,
     peer: String,
 ) -> anyhow::Result<PeerHandshake, Error> {
     let mut connection = TcpStream::connect(peer)
         .await
         .expect("Failed to connect to peer");
 
-    let mut handshake = if extension {
-        PeerHandshake::new_ext(info_hash)
-    } else {
-        PeerHandshake::new(info_hash)
-    };
+    let mut handshake = PeerHandshake::new(info_hash);
 
     {
         let handshake_bytes = handshake.mut_ptr();
@@ -144,8 +111,12 @@ async fn handshake_from_peer(
             .context("Read Handshake")?;
     }
 
-    println!("Peer ID: {}", hex::encode(handshake.peer_id));
+    let reserved = handshake.reserved.clone();
+    let ext_id = reserved[reserved.len() - 1];
+    println!("EXT ID: {}", ext_id);
+    println!("Reserved: {:?}", reserved);
 
+    println!("Peer ID: {}", hex::encode(handshake.peer_id));
     Ok(handshake)
 }
 
@@ -157,12 +128,12 @@ fn read_torrent_file(torrent: PathBuf) -> anyhow::Result<Torrent> {
 
 async fn download_peer_piece(
     torrent: Torrent,
-    tracker_response: TrackerResponse,
+    tracker_response: Tracker,
     piece_index: usize,
 ) -> anyhow::Result<Vec<u8>> {
     let peer = tracker_response.peers[0].clone();
 
-    let piece_setup: Vec<(usize, HashType)> = vec![(piece_index, torrent.info.pieces[piece_index])];
+    let piece_setup: Vec<(usize, HashId)> = vec![(piece_index, torrent.info.pieces[piece_index])];
 
     let piece_block = download_pieces(peer, &torrent.info, piece_setup).await?;
     // Attempting to resist the urge to clone the data. Seems like it'd otherwise start being expensive long term.
@@ -199,10 +170,10 @@ fn calculate_block_size(piece_size: usize, block_index: usize, num_of_blocks: us
 async fn download_pieces(
     peer: Peer,
     torrent_info: &TorrentInfo,
-    pieces: Vec<(usize, HashType)>,
+    pieces: Vec<(usize, HashId)>,
 ) -> anyhow::Result<Vec<(usize, Vec<u8>)>> {
     let mut peer = PeerConnection::connect(peer).await?;
-    peer.send_handshake(torrent_info.hash()).await?;
+    peer.send_handshake(torrent_info.hash(), false).await?;
     peer.send_interested().await?;
 
     let mut peer_connection = peer.connection.try_lock().expect("connection is locked");
@@ -248,7 +219,7 @@ async fn download_pieces(
         {
             let mut hasher = Sha1::new();
             hasher.update(&block_data);
-            let hasher: HashType = hasher.finalize().try_into().expect("hashing failed");
+            let hasher: HashId = hasher.finalize().try_into().expect("hashing failed");
             ensure!(hasher == piece_hash);
         }
 
@@ -258,10 +229,10 @@ async fn download_pieces(
     Ok(block_collection)
 }
 
-async fn download_file(torrent: Torrent, tracker: TrackerResponse) -> anyhow::Result<Vec<u8>> {
+async fn download_file(torrent: Torrent, tracker: Tracker) -> anyhow::Result<Vec<u8>> {
     let piece_count = torrent.info.pieces.len();
     let peer_count = tracker.peers.len();
-    let mut piece_distribution: HashMap<usize, Vec<(usize, HashType)>> = HashMap::new();
+    let mut piece_distribution: HashMap<usize, Vec<(usize, HashId)>> = HashMap::new();
 
     for (peer_idx, i) in (0..peer_count).cycle().zip(0..piece_count) {
         piece_distribution
@@ -293,35 +264,14 @@ async fn download_file(torrent: Torrent, tracker: TrackerResponse) -> anyhow::Re
     Ok(collected_pieces)
 }
 
-async fn fetch_magnet_tracker_info(magnet: Magnet) -> Result<TrackerResponse, Error> {
-    let req = TackerRequest {
-        peer_id: std::str::from_utf8(PEER_ID)?.to_string(),
-        port: 6881,
-        uploaded: 0,
-        downloaded: 0,
-        left: 1,
-        compact: 1,
-    };
-
-    let params = serde_urlencoded::to_string(&req)?;
-
-    let info_hash = magnet.encoded_hash();
-    let url = format!("{}?{}&info_hash={}", magnet.announce(), params, info_hash);
-
-    let response = reqwest::get(url).await.expect("Fetching tracker info");
-    let response = response.bytes().await.expect("Reading response");
-    let response = serde_bencode::from_bytes::<TrackerResponse>(&response)?;
-
-    Ok(response)
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     match args.command {
         Command::Decode { value } => {
-            println!("{}", decode_bencoded_value(value)?.to_string());
+            let value: serde_bencode::value::Value = serde_bencode::from_str(value.as_str())?;
+            println!("{}", convert(value)?.to_string());
         }
         Command::Info { torrent } => {
             let torrent = read_torrent_file(torrent)?;
@@ -342,7 +292,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Handshake { torrent, peer } => {
             let torrent = read_torrent_file(torrent)?;
-            handshake_from_peer(torrent.info.hash(), false, peer).await?;
+            handshake_from_peer(torrent.info.hash(), peer).await?;
         }
         Command::DownloadPiece(download_piece) => {
             let output = download_piece.output.unwrap();
@@ -380,10 +330,8 @@ async fn main() -> anyhow::Result<()> {
             println!("Info Hash: {}", hex::encode(magnet.info_hash))
         }
         Command::MagnetHandshake { magnet } => {
-            let magnet = Magnet::from_str(magnet.as_str())?;
-            let tracker_response = fetch_magnet_tracker_info(magnet.clone()).await?;
-            let peer = tracker_response.peers[0].ip_address();
-            handshake_from_peer(magnet.info_hash, true, peer).await?;
+            let mut magnet = Magnet::from_str(magnet.as_str())?;
+            magnet.handshake(PEER_ID).await?;
         }
     }
 

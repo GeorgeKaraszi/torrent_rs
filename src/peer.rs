@@ -1,4 +1,6 @@
 // ----------------- IMPORTS -----------------
+use crate::types::{HashId, PeerId};
+use crate::{PEER_ID, decode_bencode};
 use anyhow::{anyhow, ensure, Context, Error};
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{SinkExt, StreamExt};
@@ -12,9 +14,6 @@ use tokio::net::TcpStream;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
 // ----------------- CONSTANTS & TYPE ALIASES -----------------
-pub type HashType = [u8; 20];
-pub type PeerId = [u8; 20];
-pub const PEER_ID: &PeerId = b"-PC0001-123456701112";
 const HANDSHAKE_LENGTH: usize = size_of::<PeerHandshake>(); // 68
 const MAX_MESSAGE_LENGTH: usize = 1 << 16;
 
@@ -41,14 +40,32 @@ pub struct PeerHandshake {
     pub protocol_length: u8,
     pub protocol: [u8; 19],
     pub reserved: [u8; 8],
-    pub info_hash: HashType,
+    pub info_hash: HashId,
     pub peer_id: PeerId,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PeerMessageExt {
+    pub m: PeerExtDirectory,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_size: Option<u32>,
+    #[serde(skip_serializing)]
+    #[serde(flatten)]
+    pub _data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PeerExtDirectory {
+    pub ut_metadata: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ut_pex: Option<u8>,
 }
 
 #[repr(C)]
 #[derive(Debug)]
 pub struct PeerMessage {
     pub message_tag: MessageTag,
+    pub extension: Option<u8>,
     pub payload: Vec<u8>,
 }
 
@@ -85,12 +102,14 @@ pub enum MessageTag {
     Request = 6,
     Piece = 7,
     Cancel = 8,
+    Extension = 20,
     UNKNOWN = 9,
 }
 
 #[derive(Debug)]
 pub enum PeerFrame {
     Handshake(PeerHandshake),
+    HandshakeExt(PeerMessage),
     Message(PeerMessage),
 }
 
@@ -164,12 +183,20 @@ impl PeerConnection {
         })
     }
 
-    pub async fn send_handshake(&mut self, info_hash: HashType) -> anyhow::Result<(), Error> {
+    pub async fn send_handshake(
+        &mut self,
+        info_hash: HashId,
+        extension: bool,
+    ) -> anyhow::Result<PeerHandshake, Error> {
         let mut connection = self.connection.lock().expect("connection is locked");
 
-        connection
-            .send(PeerFrame::Handshake(PeerHandshake::new(info_hash)))
-            .await?;
+        let handshake = if extension {
+            PeerHandshake::new_ext(info_hash)
+        } else {
+            PeerHandshake::new(info_hash)
+        };
+
+        connection.send(PeerFrame::Handshake(handshake)).await?;
 
         let peer_handshake = connection
             .next()
@@ -190,7 +217,28 @@ impl PeerConnection {
             .expect_message();
 
         ensure!(bitfield.message_tag == MessageTag::Bitfield);
-        Ok(())
+        Ok(peer_handshake)
+    }
+
+    pub async fn send_extension(&mut self) -> anyhow::Result<PeerMessageExt, Error> {
+        let mut connection = self.connection.lock().expect("connection is locked");
+
+        let ext_msg = PeerMessageExt::new();
+        let peer_msg = PeerMessage::extension(ext_msg.encode());
+        connection.send(PeerFrame::HandshakeExt(peer_msg)).await?;
+
+        let peer_ext = connection
+            .next()
+            .await
+            .expect("peer always sends extension")
+            .context("peer message was invalid")?
+            .expect_message();
+
+        ensure!(peer_ext.message_tag == MessageTag::Extension);
+
+        let parsed_ext = PeerMessageExt::from_bytes(peer_ext.payload.as_slice())?;
+
+        Ok(parsed_ext)
     }
 
     pub async fn send_interested(&mut self) -> anyhow::Result<(), Error> {
@@ -214,25 +262,30 @@ impl PeerConnection {
 }
 
 impl PeerMessage {
-    pub fn new(message_tag: MessageTag, payload: Vec<u8>) -> Self {
+    pub fn new(message_tag: MessageTag, payload: Vec<u8>, extension: Option<u8>) -> Self {
         Self {
-            message_tag,
-            payload,
+            message_tag: message_tag,
+            payload: payload,
+            extension: extension,
         }
     }
 
     pub fn new_buffer(capacity: Option<usize>) -> Self {
         let capacity = capacity.unwrap_or(1024);
-        Self::new(MessageTag::UNKNOWN, Vec::with_capacity(capacity))
+        Self::new(MessageTag::UNKNOWN, Vec::with_capacity(capacity), None)
     }
 
     pub fn interested() -> Self {
-        Self::new(MessageTag::Interested, vec![])
+        Self::new(MessageTag::Interested, vec![], None)
     }
 
     pub fn request(index: u32, begin: u32, length: u32) -> Self {
         let mut request = RequestMessage::new(index, begin, length);
-        Self::new(MessageTag::Request, Vec::from(request.mut_ptr()))
+        Self::new(MessageTag::Request, Vec::from(request.mut_ptr()), None)
+    }
+
+    pub fn extension(payload: Vec<u8>) -> Self {
+        Self::new(MessageTag::Extension, payload, Some(0))
     }
 
     pub fn mut_ptr(&mut self) -> &mut [u8; size_of::<Self>()] {
@@ -271,7 +324,6 @@ impl Decoder for PeerCodec {
                 self.state = CodecState::Messages;
                 Ok(Some(PeerFrame::Handshake(peer_handshake)))
             }
-
             CodecState::Messages => {
                 if src.len() < 4 {
                     return Ok(None);
@@ -309,6 +361,7 @@ impl Decoder for PeerCodec {
                     6 => MessageTag::Request,
                     7 => MessageTag::Piece,
                     8 => MessageTag::Cancel,
+                    20 => MessageTag::Extension,
                     tag => {
                         return Err(anyhow!("Unknown message tag id: {}", tag));
                     }
@@ -325,6 +378,7 @@ impl Decoder for PeerCodec {
                 Ok(Some(PeerFrame::Message(PeerMessage::new(
                     message_tag,
                     message_payload,
+                    None,
                 ))))
             }
         }
@@ -343,6 +397,14 @@ impl Encoder<PeerFrame> for PeerCodec {
                 };
                 dst.reserve(HANDSHAKE_LENGTH);
                 dst.put_slice(bytes);
+                Ok(())
+            }
+            PeerFrame::HandshakeExt(msg) => {
+                let message_length: [u8; 4] = u32::to_be_bytes(msg.payload.len() as u32 + 2);
+                dst.put_slice(&message_length);
+                dst.put_u8(msg.message_tag as u8);
+                dst.put_u8(0 as u8);
+                dst.put_slice(&msg.payload);
                 Ok(())
             }
             PeerFrame::Message(msg) => {
@@ -381,12 +443,12 @@ impl PeerFrame {
 
 impl PeerHandshake {
     pub fn default(
-        info_hash: Option<HashType>,
+        info_hash: Option<HashId>,
         peer_id: Option<PeerId>,
         extension: Option<[u8; 8]>,
     ) -> Self {
         let peer_id = peer_id.unwrap_or(*PEER_ID);
-        let info_hash = info_hash.unwrap_or([0u8; 20]);
+        let info_hash = info_hash.unwrap_or(HashId::default());
         let reserved = extension.unwrap_or([0u8; 8]);
 
         Self {
@@ -398,11 +460,11 @@ impl PeerHandshake {
         }
     }
 
-    pub fn new(info_hash: HashType) -> Self {
+    pub fn new(info_hash: HashId) -> Self {
         Self::default(Some(info_hash), None, None)
     }
 
-    pub fn new_ext(info_hash: HashType) -> Self {
+    pub fn new_ext(info_hash: HashId) -> Self {
         let magnet_ext = (1u64 << 20).to_be_bytes().into();
         Self::default(Some(info_hash), None, Some(magnet_ext))
     }
@@ -416,6 +478,28 @@ impl PeerHandshake {
         let bytes: &mut [u8; size_of::<Self>()] = unsafe { &mut *bytes };
 
         bytes
+    }
+}
+
+impl PeerMessageExt {
+    pub fn new() -> Self {
+        Self {
+            m: PeerExtDirectory {
+                ut_metadata: 1,
+                ut_pex: None,
+            },
+            metadata_size: None,
+            _data: serde_json::Value::Null,
+        }
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self, Error> {
+        let bytes = bytes[1..].as_ref();
+        decode_bencode(bytes)
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        serde_bencode::to_bytes(self).unwrap()
     }
 }
 
