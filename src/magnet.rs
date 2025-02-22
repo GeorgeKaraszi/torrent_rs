@@ -1,4 +1,4 @@
-use crate::peer::{PeerConnection, PeerHandshake};
+use crate::peer::PeerConnection;
 use crate::tracker::Tracker;
 use crate::types::{HashId, PeerId};
 use anyhow::{anyhow, Error, Result};
@@ -73,16 +73,16 @@ impl Magnet {
         Ok(self.tracker())
     }
 
-    pub async fn handshake(&mut self, peer_id: &PeerId) -> Result<PeerHandshake, Error> {
+    pub async fn handshake(&mut self, peer_id: &PeerId) -> Result<(), Error> {
         let tracker = self.discover_peers(peer_id).await?;
 
         let mut peer = PeerConnection::connect(tracker.peers[0].clone()).await?;
-        let peer_handshake = peer.send_handshake(self.info_hash, true).await?;
-        let peer_extension = peer.send_extension().await?;
+        peer.send_handshake(self.info_hash, true).await?;
+        peer.send_extension().await?;
 
-        println!("Peer ID: {}", hex::encode(peer_handshake.peer_id));
-        println!("Extension: {:#?}", peer_extension);
+        println!("Peer ID: {}", hex::encode(peer.peer_id()));
+        println!("Peer Metadata Extension ID: {}", peer.metadata_id());
 
-        Ok(peer_handshake)
+        Ok(())
     }
 }

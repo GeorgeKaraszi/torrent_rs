@@ -1,6 +1,6 @@
 // ----------------- IMPORTS -----------------
 use crate::types::{HashId, PeerId};
-use crate::{PEER_ID, decode_bencode};
+use crate::{decode_bencode, PEER_ID};
 use anyhow::{anyhow, ensure, Context, Error};
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{SinkExt, StreamExt};
@@ -30,6 +30,8 @@ pub struct Peer {
 #[derive(Clone)]
 pub struct PeerConnection {
     pub peer: Peer,
+    pub peer_id: Option<PeerId>,
+    pub metadata_id: Option<u8>,
     pub connection: Arc<Mutex<Framed<TcpStream, PeerCodec>>>,
 }
 
@@ -179,8 +181,24 @@ impl PeerConnection {
 
         Ok(Self {
             peer: peer,
+            peer_id: None,
+            metadata_id: None,
             connection: Arc::new(Mutex::new(Framed::new(connection, PeerCodec::new()))),
         })
+    }
+
+    pub fn peer_id(&self) -> PeerId {
+        match self.peer_id {
+            Some(peer_id) => peer_id,
+            None => panic!("Peer ID is not set you must send a handshake first"),
+        }
+    }
+
+    pub fn metadata_id(&self) -> u8 {
+        match self.metadata_id {
+            Some(metadata_id) => metadata_id,
+            None => panic!("Metadata ID is not set you must send an extension handshake first"),
+        }
     }
 
     pub async fn send_handshake(
@@ -217,6 +235,9 @@ impl PeerConnection {
             .expect_message();
 
         ensure!(bitfield.message_tag == MessageTag::Bitfield);
+
+        self.peer_id = Some(peer_handshake.peer_id);
+
         Ok(peer_handshake)
     }
 
@@ -237,6 +258,8 @@ impl PeerConnection {
         ensure!(peer_ext.message_tag == MessageTag::Extension);
 
         let parsed_ext = PeerMessageExt::from_bytes(peer_ext.payload.as_slice())?;
+
+        self.metadata_id = Some(parsed_ext.m.ut_metadata);
 
         Ok(parsed_ext)
     }
