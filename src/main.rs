@@ -4,8 +4,8 @@ use codecrafters_bittorrent::magnet::*;
 use codecrafters_bittorrent::peer::*;
 use codecrafters_bittorrent::torrent::{Torrent, TorrentInfo};
 use codecrafters_bittorrent::tracker::{TackerRequest, Tracker};
+use codecrafters_bittorrent::types::HashId;
 use codecrafters_bittorrent::{convert, PEER_ID};
-use codecrafters_bittorrent::types::{HashId};
 use futures::{SinkExt, StreamExt};
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
@@ -46,6 +46,10 @@ enum Command {
     },
     #[command(name = "magnet_handshake")]
     MagnetHandshake {
+        magnet: String,
+    },
+    #[command(name = "magnet_info")]
+    MagnetInfo {
         magnet: String,
     },
 }
@@ -332,6 +336,10 @@ async fn main() -> anyhow::Result<()> {
         Command::MagnetHandshake { magnet } => {
             let mut magnet = Magnet::from_str(magnet.as_str())?;
             magnet.handshake(PEER_ID).await?;
+        }
+        Command::MagnetInfo { magnet } => {
+            let mut magnet = Magnet::from_str(magnet.as_str())?;
+            magnet.request_info(PEER_ID).await?;
         }
     }
 

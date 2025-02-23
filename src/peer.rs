@@ -36,6 +36,7 @@ pub struct PeerConnection {
 }
 
 // ----------------- NETWORKING & PROTOCOL -----------------
+
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct PeerHandshake {
@@ -46,9 +47,23 @@ pub struct PeerHandshake {
     pub peer_id: PeerId,
 }
 
+#[repr(C)]
+#[derive(Debug)]
+pub struct PeerMessage {
+    pub message_tag: MessageTag,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerExtensionMessage {
+    pub extension_tag: PeerMessageExtensionTag,
+    pub payload: ExtensionPayload,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PeerMessageExt {
-    pub m: PeerExtDirectory,
+pub struct ExtensionPayload {
+    #[serde(rename = "m")]
+    pub metadata: ExtensionDirectory,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_size: Option<u32>,
     #[serde(skip_serializing)]
@@ -57,18 +72,10 @@ pub struct PeerMessageExt {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PeerExtDirectory {
+pub struct ExtensionDirectory {
     pub ut_metadata: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ut_pex: Option<u8>,
-}
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct PeerMessage {
-    pub message_tag: MessageTag,
-    pub extension: Option<u8>,
-    pub payload: Vec<u8>,
 }
 
 #[repr(C)]
@@ -94,6 +101,15 @@ pub struct PeerCodec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+pub enum PeerMessageExtensionTag {
+    Handshake = 0,
+    Request = 1,
+    Data = 2,
+    Reject = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum MessageTag {
     Choke = 0,
     Unchoke = 1,
@@ -111,7 +127,6 @@ pub enum MessageTag {
 #[derive(Debug)]
 pub enum PeerFrame {
     Handshake(PeerHandshake),
-    HandshakeExt(PeerMessage),
     Message(PeerMessage),
 }
 
@@ -121,7 +136,13 @@ pub enum CodecState {
     Messages,
 }
 
-// Implementations
+pub trait MessagePayloadEncoder {
+    fn encode(&self) -> Vec<u8>;
+}
+
+pub trait MessagePayloadDecoder: Sized {
+    fn decode(bytes: &[u8]) -> Result<Self, Error>;
+}
 
 impl Deref for Peers {
     type Target = Vec<Peer>;
@@ -241,12 +262,15 @@ impl PeerConnection {
         Ok(peer_handshake)
     }
 
-    pub async fn send_extension(&mut self) -> anyhow::Result<PeerMessageExt, Error> {
+    pub async fn send_extension(
+        &mut self,
+        message: PeerExtensionMessage,
+    ) -> anyhow::Result<PeerExtensionMessage, Error> {
         let mut connection = self.connection.lock().expect("connection is locked");
 
-        let ext_msg = PeerMessageExt::new();
-        let peer_msg = PeerMessage::extension(ext_msg.encode());
-        connection.send(PeerFrame::HandshakeExt(peer_msg)).await?;
+        connection
+            .send(PeerFrame::Message(PeerMessage::extension_message(message)))
+            .await?;
 
         let peer_ext = connection
             .next()
@@ -257,9 +281,9 @@ impl PeerConnection {
 
         ensure!(peer_ext.message_tag == MessageTag::Extension);
 
-        let parsed_ext = PeerMessageExt::from_bytes(peer_ext.payload.as_slice())?;
+        let parsed_ext = peer_ext.decode::<PeerExtensionMessage>()?;
 
-        self.metadata_id = Some(parsed_ext.m.ut_metadata);
+        self.metadata_id = Some(parsed_ext.payload.metadata.ut_metadata);
 
         Ok(parsed_ext)
     }
@@ -285,37 +309,41 @@ impl PeerConnection {
 }
 
 impl PeerMessage {
-    pub fn new(message_tag: MessageTag, payload: Vec<u8>, extension: Option<u8>) -> Self {
+    fn new(message_tag: MessageTag, payload: Vec<u8>) -> Self {
         Self {
             message_tag: message_tag,
             payload: payload,
-            extension: extension,
         }
+    }
+
+    pub fn new_message<T>(message_tag: MessageTag, payload: T) -> Self
+    where
+        T: MessagePayloadEncoder,
+    {
+        Self::new(message_tag, payload.encode())
     }
 
     pub fn new_buffer(capacity: Option<usize>) -> Self {
         let capacity = capacity.unwrap_or(1024);
-        Self::new(MessageTag::UNKNOWN, Vec::with_capacity(capacity), None)
+        let payload: Vec<u8> = Vec::with_capacity(capacity);
+        Self::new(MessageTag::UNKNOWN, payload)
     }
 
     pub fn interested() -> Self {
-        Self::new(MessageTag::Interested, vec![], None)
+        Self::new(MessageTag::Interested, vec![])
     }
 
     pub fn request(index: u32, begin: u32, length: u32) -> Self {
-        let mut request = RequestMessage::new(index, begin, length);
-        Self::new(MessageTag::Request, Vec::from(request.mut_ptr()), None)
+        let request = RequestMessage::new(index, begin, length);
+        Self::new_message(MessageTag::Request, request)
     }
 
-    pub fn extension(payload: Vec<u8>) -> Self {
-        Self::new(MessageTag::Extension, payload, Some(0))
+    pub fn extension_message(payload: PeerExtensionMessage) -> Self {
+        Self::new_message(MessageTag::Extension, payload)
     }
 
-    pub fn mut_ptr(&mut self) -> &mut [u8; size_of::<Self>()] {
-        let bytes = self as *mut Self as *mut [u8; size_of::<Self>()];
-        let bytes: &mut [u8; size_of::<Self>()] = unsafe { &mut *bytes };
-
-        bytes
+    pub fn decode<T: MessagePayloadDecoder>(&self) -> Result<T, Error> {
+        T::decode(self.payload.as_slice())
     }
 }
 
@@ -398,11 +426,9 @@ impl Decoder for PeerCodec {
 
                 src.advance(4 + length);
 
-                Ok(Some(PeerFrame::Message(PeerMessage::new(
-                    message_tag,
-                    message_payload,
-                    None,
-                ))))
+                let peer_message = PeerMessage::new(message_tag, message_payload);
+
+                Ok(Some(PeerFrame::Message(peer_message)))
             }
         }
     }
@@ -420,14 +446,6 @@ impl Encoder<PeerFrame> for PeerCodec {
                 };
                 dst.reserve(HANDSHAKE_LENGTH);
                 dst.put_slice(bytes);
-                Ok(())
-            }
-            PeerFrame::HandshakeExt(msg) => {
-                let message_length: [u8; 4] = u32::to_be_bytes(msg.payload.len() as u32 + 2);
-                dst.put_slice(&message_length);
-                dst.put_u8(msg.message_tag as u8);
-                dst.put_u8(0 as u8);
-                dst.put_slice(&msg.payload);
                 Ok(())
             }
             PeerFrame::Message(msg) => {
@@ -504,25 +522,56 @@ impl PeerHandshake {
     }
 }
 
-impl PeerMessageExt {
+impl PeerExtensionMessage {
+    pub fn handshake() -> Self {
+        Self {
+            extension_tag: PeerMessageExtensionTag::Handshake,
+            payload: ExtensionPayload::new(),
+        }
+    }
+}
+
+impl MessagePayloadEncoder for PeerExtensionMessage {
+    fn encode(&self) -> Vec<u8> {
+        let encoded_payload = serde_bencode::to_bytes(&self.payload).unwrap();
+        let mut bytes = Vec::with_capacity(encoded_payload.len() + 1);
+        bytes.push(self.extension_tag as u8);
+        bytes.extend_from_slice(&encoded_payload);
+        bytes
+    }
+}
+
+impl MessagePayloadDecoder for PeerExtensionMessage {
+    fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        let message_tag = match bytes[0] {
+            0 => PeerMessageExtensionTag::Handshake,
+            1 => PeerMessageExtensionTag::Request,
+            2 => PeerMessageExtensionTag::Data,
+            3 => PeerMessageExtensionTag::Reject,
+            tag => {
+                return Err(anyhow!("Unknown extension tag id: {}", tag));
+            }
+        };
+
+        let payload: ExtensionPayload = decode_bencode(&bytes[1..])?;
+
+        Ok(Self {
+            extension_tag: message_tag,
+            payload: payload,
+        })
+    }
+}
+
+impl ExtensionPayload {
     pub fn new() -> Self {
         Self {
-            m: PeerExtDirectory {
+            metadata: ExtensionDirectory {
                 ut_metadata: 1,
                 ut_pex: None,
             },
             metadata_size: None,
             _data: serde_json::Value::Null,
         }
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self, Error> {
-        let bytes = bytes[1..].as_ref();
-        decode_bencode(bytes)
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        serde_bencode::to_bytes(self).unwrap()
     }
 }
 
@@ -539,6 +588,39 @@ impl RequestMessage {
         let bytes: &mut [u8; size_of::<Self>()] = unsafe { &mut *bytes };
 
         bytes
+    }
+
+    pub fn as_slice(&self) -> &[u8; size_of::<Self>()] {
+        let bytes = self as *const Self as *const [u8; size_of::<Self>()];
+        let bytes: &[u8; size_of::<Self>()] = unsafe { &*bytes };
+
+        bytes
+    }
+}
+
+impl MessagePayloadEncoder for RequestMessage {
+    fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(size_of::<Self>());
+        bytes.extend_from_slice(self.as_slice());
+        bytes
+    }
+}
+
+impl MessagePayloadDecoder for RequestMessage {
+    fn decode(_bytes: &[u8]) -> Result<Self, Error> {
+        panic!("Not implemented yet")
+    }
+}
+
+impl MessagePayloadEncoder for Vec<u8> {
+    fn encode(&self) -> Vec<u8> {
+        self.clone()
+    }
+}
+
+impl MessagePayloadDecoder for Vec<u8> {
+    fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        Ok(bytes.to_vec())
     }
 }
 

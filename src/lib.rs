@@ -6,9 +6,10 @@ pub mod types;
 
 pub const PEER_ID: &types::PeerId = b"-PC0001-123456701112";
 
-pub fn decode_bencode<T: serde::de::DeserializeOwned>(
-    data: &[u8],
-) -> anyhow::Result<T, anyhow::Error> {
+pub fn decode_bencode<T>(data: &[u8]) -> anyhow::Result<T, anyhow::Error>
+where
+    T: serde::de::DeserializeOwned,
+{
     let decoded: serde_bencode::value::Value =
         serde_bencode::from_bytes(data).expect("Deserializing bytes");
     let parsed: serde_json::Value = convert(decoded)?.into();
