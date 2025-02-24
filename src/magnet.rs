@@ -87,7 +87,11 @@ impl Magnet {
     }
 
     pub async fn request_info(&mut self, peer_id: &PeerId) -> Result<(), Error> {
-        let _peer = self.handshake(peer_id).await?;
+        let mut peer = self.handshake(peer_id).await?;
+
+        let response = peer.send_metadata_request().await?;
+
+        println!("{}", response.payload.data.to_string());
 
         Ok(())
     }
