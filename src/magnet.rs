@@ -1,4 +1,4 @@
-use crate::peer::PeerConnection;
+use crate::torrent::TorrentInfo;
 use crate::tracker::Tracker;
 use crate::types::{HashId, PeerId};
 use anyhow::{anyhow, Error, Result};
@@ -11,6 +11,7 @@ pub struct Magnet {
     pub info_hash: HashId,
     pub announce: Option<String>,
     tracker: Option<Tracker>,
+    torrent_info: Option<TorrentInfo>,
 }
 
 impl Magnet {
@@ -46,6 +47,7 @@ impl Magnet {
             info_hash: info_hash.expect("no hash found"),
             announce: announce,
             tracker: None,
+            torrent_info: None,
         })
     }
 
@@ -63,36 +65,21 @@ impl Magnet {
         }
     }
 
+    pub fn torrent_info(&self) -> &TorrentInfo {
+        self.torrent_info.as_ref().expect("torrent info missing")
+    }
+
     pub async fn discover_peers(&mut self, peer_id: &PeerId) -> Result<&Tracker, Error> {
         if self.tracker.is_none() {
-            self.tracker = Tracker::discover_peers(peer_id, self.announce(), self.info_hash, 20)
-                .await
-                .ok();
+            self.tracker =
+                Some(Tracker::discover_peers(peer_id, self.announce(), self.info_hash, 20).await?);
         }
 
         Ok(self.tracker())
     }
 
-    pub async fn handshake(&mut self, peer_id: &PeerId) -> Result<PeerConnection, Error> {
-        let tracker = self.discover_peers(peer_id).await?;
-
-        let mut peer = PeerConnection::connect(tracker.peers[0].clone()).await?;
-        peer.send_handshake(self.info_hash, true).await?;
-        peer.send_extension_handshake().await?;
-
-        println!("Peer ID: {}", hex::encode(peer.peer_id()));
-        println!("Peer Metadata Extension ID: {}", peer.metadata_id());
-
-        Ok(peer)
-    }
-
-    pub async fn request_info(&mut self, peer_id: &PeerId) -> Result<(), Error> {
-        let mut peer = self.handshake(peer_id).await?;
-
-        let response = peer.send_metadata_request().await?;
-
-        println!("{}", response.payload.data.to_string());
-
-        Ok(())
+    pub async fn store_torrent_info(&mut self, torrent_info: &TorrentInfo) -> Result<&TorrentInfo> {
+        self.torrent_info = Some(torrent_info.clone());
+        Ok(self.torrent_info())
     }
 }

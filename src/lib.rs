@@ -4,6 +4,7 @@ pub mod peer_messages;
 pub mod torrent;
 pub mod tracker;
 pub mod types;
+pub mod peer_v2;
 
 pub const PEER_ID: &types::PeerId = b"-PC0001-123456701112";
 

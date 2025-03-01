@@ -1,7 +1,8 @@
-use crate::peer::Peers;
+// use crate::peer::Peers;
+use crate::peer_v2::Peers;
 use crate::types::{HashId, PeerId};
 use anyhow::{Error, Result};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 #[derive(Debug, Serialize)]
 pub struct TackerRequest {
@@ -13,7 +14,7 @@ pub struct TackerRequest {
     pub compact: usize,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, serde::Deserialize, Clone)]
 #[warn(dead_code)]
 pub struct Tracker {
     #[serde(rename = "interval")]

@@ -1,15 +1,10 @@
-use crate::peer_messages::MessageTag::UNKNOWN;
 use crate::torrent::TorrentInfo;
 use crate::types::{HashId, PeerId, Result};
 use crate::{decode_bencode, PEER_ID};
-use anyhow::Error;
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use std::fmt::Debug;
-use tokio_util::codec::{Decoder, Encoder};
-// ----------------- CONSTANTS & TYPE ALIASES -----------------
 
-const HANDSHAKE_LENGTH: usize = size_of::<PeerHandshake>(); // 68
-const MAX_MESSAGE_LENGTH: usize = 1 << 16;
+// ----------------- CONSTANTS & TYPE ALIASES -----------------
 
 pub type PeerMessageBuffer = PeerMessage<Vec<u8>>;
 pub type PeerExtMessageBuffer<T = Vec<u8>> = PeerMessage<ExtensionPayload<T>>;
@@ -22,8 +17,6 @@ pub trait MessageSerialization {
     where
         Self: Sized;
 }
-
-trait SendableMessage {}
 
 // ----------------- MESSAGE TAGS -----------------
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -39,7 +32,6 @@ pub enum MessageTag {
     Piece = 7,
     Cancel = 8,
     Extension = 20,
-    UNKNOWN = 255,
 }
 
 // ----------------- MESSAGE STRUCTS -----------------
@@ -102,7 +94,7 @@ pub struct ExtensionPieceRequestMessage {
     pub piece: u32,
     pub total_size: u32,
     #[serde(skip)]
-    pub torrent_info: Option<TorrentInfo>,
+    torrent_info: Option<TorrentInfo>,
 }
 
 // ----------------- IMPLEMENTATIONS -----------------
@@ -120,11 +112,7 @@ impl MessageTag {
             7 => Ok(Self::Piece),
             8 => Ok(Self::Cancel),
             20 => Ok(Self::Extension),
-            // _ => anyhow::bail!("Unknown tag {}", tag),
-            _ => {
-                println!("UNKNOWN TAG: {:?}", tag);
-                Ok(UNKNOWN)
-            }
+            _ => anyhow::bail!("Unknown tag {}", tag),
         }
     }
 }
@@ -150,21 +138,12 @@ impl PeerHandshake {
     }
 }
 
-impl SendableMessage for PeerHandshake {}
-
 impl MessageSerialization for PeerHandshake {
     fn serialize(&self) -> Result<Vec<u8>> {
         bincode::serialize(self).map_err(Into::into)
     }
 
     fn deserialize(data: &[u8]) -> Result<Self> {
-        anyhow::ensure!(
-            data.len() == HANDSHAKE_LENGTH,
-            "Invalid handshake size Expected {} Got {}",
-            HANDSHAKE_LENGTH,
-            data.len()
-        );
-
         bincode::deserialize(data).map_err(Into::into)
     }
 }
@@ -180,8 +159,6 @@ where
         }
     }
 }
-
-impl<T> SendableMessage for PeerMessage<T> where T: MessageSerialization {}
 
 impl PeerMessage<Vec<u8>> {
     pub fn convert<D>(&self) -> Result<PeerMessage<D>>
@@ -319,6 +296,10 @@ impl ExtensionPieceRequestMessage {
             torrent_info: None,
         }
     }
+
+    pub fn torrent_info(&self) -> &TorrentInfo {
+        self.torrent_info.as_ref().expect("torrent info missing")
+    }
 }
 
 impl MessageSerialization for ExtensionPieceRequestMessage {
@@ -349,135 +330,5 @@ impl MessageSerialization for ExtensionPieceRequestMessage {
         }
 
         Ok(payload)
-    }
-}
-
-// ----------------- CODEC -----------------
-
-#[derive(Debug)]
-pub enum PeerFrame {
-    Handshake(PeerHandshake),
-    Message(PeerMessageBuffer),
-}
-
-#[derive(Debug, PartialEq)]
-pub enum CodecState {
-    WaitingHandshake,
-    Messages,
-}
-
-pub struct PeerCodec {
-    pub state: CodecState,
-}
-
-impl PeerCodec {
-    pub fn new() -> Self {
-        Self {
-            state: CodecState::WaitingHandshake,
-        }
-    }
-}
-
-impl PeerFrame {
-    pub fn expect_handshake(self) -> Result<PeerHandshake> {
-        match self {
-            PeerFrame::Handshake(handshake) => Ok(handshake),
-            _ => anyhow::bail!("Expected PeerFrame::Handshake got {:#?}", self),
-        }
-    }
-
-    pub fn expect_message<T>(self) -> Result<PeerMessage<T>>
-    where
-        T: MessageSerialization + Debug,
-    {
-        match self {
-            PeerFrame::Message(message) => message.convert::<T>(),
-            _ => anyhow::bail!("Expected PeerFrame::Message got {:#?}", self),
-        }
-    }
-
-    pub fn expect_extension_message<T>(self) -> Result<PeerMessage<ExtensionPayload<T>>>
-    where
-        T: MessageSerialization + Debug,
-    {
-        self.expect_message::<ExtensionPayload<T>>()
-    }
-
-    pub fn unwrap_message(self) -> PeerMessageBuffer {
-        match self {
-            PeerFrame::Message(message) => message,
-            _ => panic!("Expected PeerFrame::Message got {:#?}", self),
-        }
-    }
-}
-
-impl Decoder for PeerCodec {
-    type Item = PeerFrame;
-    type Error = Error;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
-        match self.state {
-            CodecState::WaitingHandshake => {
-                if src.len() < HANDSHAKE_LENGTH {
-                    return Ok(None);
-                }
-
-                let handshake = PeerHandshake::deserialize(&src[..HANDSHAKE_LENGTH])?;
-                src.advance(HANDSHAKE_LENGTH);
-
-                self.state = CodecState::Messages;
-                Ok(Some(PeerFrame::Handshake(handshake)))
-            }
-            CodecState::Messages => {
-                if src.len() < 4 {
-                    return Ok(None);
-                }
-
-                let mut length_bytes = [0u8; 4];
-                length_bytes.copy_from_slice(&src[..4]);
-                let length = u32::from_be_bytes(length_bytes) as usize;
-                let message_length = length + 4;
-
-                if length == 0 {
-                    src.advance(4);
-                    return Ok(None);
-                }
-
-                if src.len() < 5 {
-                    return Ok(None);
-                }
-
-                if length > MAX_MESSAGE_LENGTH {
-                    anyhow::bail!(
-                        "Message length exceeds maximum allowed length: Max {} Got {}",
-                        MAX_MESSAGE_LENGTH,
-                        length
-                    );
-                }
-
-                if src.len() < message_length {
-                    src.reserve(message_length - src.len());
-                    return Ok(None);
-                }
-
-                let payload = &src[..message_length];
-                let peer_message = PeerMessageBuffer::deserialize(payload)?;
-                src.advance(message_length);
-
-                Ok(Some(PeerFrame::Message(peer_message)))
-            }
-        }
-    }
-}
-
-impl<T> Encoder<T> for PeerCodec
-where
-    T: MessageSerialization + SendableMessage,
-{
-    type Error = Error;
-
-    fn encode(&mut self, item: T, dst: &mut BytesMut) -> Result<()> {
-        dst.extend(item.serialize()?);
-        Ok(())
     }
 }
