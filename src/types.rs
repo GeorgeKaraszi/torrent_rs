@@ -1,10 +1,12 @@
 use hex::FromHex;
 use sha1::{digest::generic_array::GenericArray, digest::typenum::U20};
 
+pub type Result<T> = anyhow::Result<T, anyhow::Error>;
+
 pub type HashType = [u8; 20];
 pub type PeerId = HashType;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct HashId(pub HashType);
 
 impl std::ops::Deref for HashId {
@@ -49,9 +51,9 @@ impl AsRef<[u8]> for HashId {
 }
 
 impl FromHex for HashId {
-    type Error = hex::FromHexError;
+    type Error = anyhow::Error;
 
-    fn from_hex<T: AsRef<[u8]>>(hex: T) -> Result<Self, Self::Error> {
+    fn from_hex<T: AsRef<[u8]>>(hex: T) -> Result<Self> {
         let mut out = Self::default();
         hex::decode_to_slice(hex, &mut out.0 as &mut [u8])?;
         Ok(out)
@@ -61,7 +63,7 @@ impl FromHex for HashId {
 impl TryFrom<GenericArray<u8, U20>> for HashId {
     type Error = anyhow::Error;
 
-    fn try_from(arr: GenericArray<u8, U20>) -> Result<Self, Self::Error> {
+    fn try_from(arr: GenericArray<u8, U20>) -> Result<Self> {
         let mut hash = [0u8; 20];
         hash.copy_from_slice(&arr);
         Ok(HashId(hash))

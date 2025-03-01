@@ -2,6 +2,7 @@ use anyhow::{ensure, Context, Error};
 use clap::{Parser, Subcommand};
 use codecrafters_bittorrent::magnet::*;
 use codecrafters_bittorrent::peer::*;
+use codecrafters_bittorrent::peer_messages as pm;
 use codecrafters_bittorrent::torrent::{Torrent, TorrentInfo};
 use codecrafters_bittorrent::tracker::{TackerRequest, Tracker};
 use codecrafters_bittorrent::types::HashId;
@@ -12,6 +13,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_util::codec::Framed;
 
 const BLOCK_MAX: usize = 1 << 14;
 
@@ -50,6 +52,10 @@ enum Command {
     },
     #[command(name = "magnet_info")]
     MagnetInfo {
+        magnet: String,
+    },
+    #[command(name = "magnet_test")]
+    MagnetTest {
         magnet: String,
     },
 }
@@ -268,6 +274,90 @@ async fn download_file(torrent: Torrent, tracker: Tracker) -> anyhow::Result<Vec
     Ok(collected_pieces)
 }
 
+async fn call_tests(magnet: String) -> anyhow::Result<()> {
+    let mut magnet = Magnet::from_str(magnet.as_str())?;
+    let tracker = magnet.discover_peers(PEER_ID).await?;
+    let connection = TcpStream::connect(tracker.peers[0].ip_address())
+        .await
+        .context("Failed to connect to peer")?;
+
+    let mut peer = Framed::new(connection, pm::PeerCodec::new());
+
+    let handshake = pm::PeerHandshake::new(Some(magnet.info_hash), None, true);
+    peer.send(handshake).await.context("Sending handshake")?;
+
+    let peer_handshake = peer
+        .next()
+        .await
+        .expect("peer always sends handshake")?
+        .expect_handshake()?;
+
+    ensure!(peer_handshake.protocol_length == 19);
+    ensure!(&peer_handshake.protocol == b"BitTorrent protocol");
+    ensure!(&peer_handshake.peer_id != PEER_ID);
+
+    let bitfield = peer
+        .next()
+        .await
+        .expect("peer always sends bitfields")
+        .context("peer message was invalid")?
+        .unwrap_message();
+
+    ensure!(bitfield.message_tag == pm::MessageTag::Bitfield);
+
+    let ext_handshake = pm::ExtensionHandshakeMessage::default();
+    let ext_request = pm::ExtensionPayload::new(0, ext_handshake).into_peer_message();
+
+    peer.send(ext_request)
+        .await
+        .context("Sending extension handshake")?;
+
+    let ext_response = peer
+        .next()
+        .await
+        .expect("peer always sends extension response")
+        .context("peer message was invalid")?
+        .expect_extension_message::<pm::ExtensionHandshakeMessage>()?;
+
+    let metadata_id = ext_response.message.payload.metadata.ut_metadata;
+
+    ensure!(metadata_id != 0, "metadata id is not 0");
+
+    ensure!(ext_response.message_tag == pm::MessageTag::Extension);
+
+    let ext_request =
+        pm::ExtensionPayload::new(metadata_id, pm::ExtensionPieceRequestMessage::default())
+            .into_peer_message();
+
+    peer.send(ext_request)
+        .await
+        .context("Sending extension request")?;
+
+    let ext_response = peer
+        .next()
+        .await
+        .expect("peer always sends extension response")
+        .context("peer message was invalid")?
+        .expect_extension_message::<pm::ExtensionPieceRequestMessage>()?;
+
+    ensure!(ext_response.message_tag == pm::MessageTag::Extension);
+
+    let torrent_info = ext_response.message.payload.torrent_info.unwrap();
+
+
+    println!("Peer ID: {}", hex::encode(peer_handshake.peer_id));
+    println!("Peer Metadata Extension ID: {}", metadata_id);
+    println!("Tracker URL: {}", magnet.announce());
+    println!("Length: {}", torrent_info.length);
+    println!("Info Hash: {}", hex::encode(magnet.info_hash));
+    println!("Piece Length: {}", torrent_info.piece_length);
+    println!("Piece Hashes:");
+    for hash in torrent_info.pieces.encoded_hashes() {
+        println!("{}", hash);
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -338,8 +428,12 @@ async fn main() -> anyhow::Result<()> {
             magnet.handshake(PEER_ID).await?;
         }
         Command::MagnetInfo { magnet } => {
-            let mut magnet = Magnet::from_str(magnet.as_str())?;
-            magnet.request_info(PEER_ID).await?;
+            call_tests(magnet).await?;
+            // let mut magnet = Magnet::from_str(magnet.as_str())?;
+            // magnet.request_info(PEER_ID).await?;
+        }
+        Command::MagnetTest { magnet } => {
+            call_tests(magnet).await?;
         }
     }
 

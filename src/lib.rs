@@ -1,5 +1,6 @@
 pub mod magnet;
 pub mod peer;
+pub mod peer_messages;
 pub mod torrent;
 pub mod tracker;
 pub mod types;

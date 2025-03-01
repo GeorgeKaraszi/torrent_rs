@@ -1,8 +1,8 @@
+use crate::types::HashId;
 use serde::de::{Deserialize, Deserializer};
 use serde::ser::{Serialize, Serializer};
 use sha1::{Digest, Sha1};
 use std::ops::{Deref, DerefMut};
-use crate::types::HashId;
 
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Torrent {
@@ -10,7 +10,7 @@ pub struct Torrent {
     pub info: TorrentInfo,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Eq, PartialEq)]
 pub struct TorrentInfo {
     pub name: String,
     #[serde(rename = "piece length")]
@@ -19,8 +19,8 @@ pub struct TorrentInfo {
     pub length: usize,
 }
 
-#[derive(Debug, Clone)]
-pub struct PiecesHashes(Vec<HashId>);
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PiecesHashes(pub Vec<HashId>);
 
 impl TorrentInfo {
     pub fn hash(&self) -> HashId {
@@ -75,7 +75,7 @@ impl<'de> Deserialize<'de> for PiecesHashes {
     where
         D: Deserializer<'de>,
     {
-        let bytes: Vec<u8> = serde_bytes::Deserialize::deserialize(deserializer)?;
+        let bytes: Vec<u8> = serde_bytes::deserialize(deserializer)?;
 
         if bytes.len() % 20 != 0 {
             return Err(serde::de::Error::custom(
