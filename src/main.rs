@@ -1,8 +1,8 @@
 use anyhow::ensure;
 use clap::{Parser, Subcommand};
 use codecrafters_bittorrent::magnet::*;
-use codecrafters_bittorrent::peer::*;
 use codecrafters_bittorrent::messages::PeerHandshake;
+use codecrafters_bittorrent::peer::*;
 use codecrafters_bittorrent::torrent::{Torrent, TorrentInfo};
 use codecrafters_bittorrent::tracker::{TackerRequest, Tracker};
 use codecrafters_bittorrent::types::{HashId, Result};
@@ -50,6 +50,13 @@ enum Command {
     #[command(name = "magnet_info")]
     MagnetInfo {
         magnet: String,
+    },
+    #[command(name = "magnet_download_piece")]
+    MagnetDownloadPiece {
+        #[arg(short, long)] // Allows both `-o` and `--output`
+        output: PathBuf,
+        magnet: String,
+        piece_index: usize,
     },
 }
 
@@ -246,12 +253,8 @@ async fn magnet_info(magnet: String) -> anyhow::Result<()> {
     let tracker = magnet.discover_peers(PEER_ID).await?;
     let mut peer = PeerConnection::connect(&tracker.peers[0]).await?;
 
-    peer.send_handshake(magnet.info_hash.clone(), true).await?;
-    peer.exchange_magnet_info().await?;
-
-    let requested_info = peer.request_magnet_torrent_info().await?;
-
-    let torrent_info = requested_info.message.payload.torrent_info();
+    magnet.retrieve_magnet_info(&mut peer).await?;
+    let torrent_info = magnet.torrent_info();
 
     println!("Peer ID: {}", hex::encode(peer.peer_id()));
     println!("Peer Metadata Extension ID: {}", peer.metadata_id());
@@ -264,6 +267,46 @@ async fn magnet_info(magnet: String) -> anyhow::Result<()> {
         println!("{}", hash);
     }
     Ok(())
+}
+
+async fn download_magnet_piece(magnet: String, piece_index: usize) -> anyhow::Result<Vec<u8>> {
+    let mut magnet = Magnet::from_str(magnet.as_str())?;
+    let tracker = magnet.discover_peers(PEER_ID).await?;
+    let mut peer = PeerConnection::connect(&tracker.peers[0]).await?;
+
+
+    magnet.retrieve_magnet_info(&mut peer).await?;
+    peer.send_interest().await?;
+
+    let mut block_data = Vec::new();
+    let torrent_info = magnet.torrent_info();
+    let piece_size = torrent_info.calculate_piece_size(piece_index);
+    let piece_hash = torrent_info.pieces[piece_index].clone();
+
+    let num_of_blocks = (piece_size + (BLOCK_MAX - 1)) / BLOCK_MAX;
+
+    for block in 0..num_of_blocks {
+        let block_size = calculate_block_size(piece_size, block, num_of_blocks);
+
+        let piece = peer
+            .download_piece(
+                piece_index as u32,
+                (block * BLOCK_MAX) as u32,
+                block_size as u32,
+            )
+            .await?;
+
+        block_data.extend_from_slice(piece.message.block());
+    }
+
+    {
+        let mut hasher = Sha1::new();
+        hasher.update(&block_data);
+        let hasher: HashId = hasher.finalize().try_into().expect("hashing failed");
+        ensure!(hasher == piece_hash);
+    }
+
+    Ok(block_data)
 }
 
 #[tokio::main]
@@ -336,6 +379,19 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::MagnetInfo { magnet } => {
             magnet_info(magnet).await?;
+        }
+        Command::MagnetDownloadPiece {
+            output,
+            magnet,
+            piece_index,
+        } => {
+            let raw_file_data = download_magnet_piece(magnet, piece_index).await?;
+
+            tokio::fs::write(output.clone(), raw_file_data)
+                .await
+                .expect("writing file");
+
+            println!("downloaded to: {}", output.display());
         }
     }
 

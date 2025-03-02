@@ -84,10 +84,22 @@ pub struct PieceMessage {
 pub struct ExtensionHandshakeMessage {
     #[serde(rename = "m")]
     pub metadata: ExtensionHandshakeMetaData,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "p")]
+    pub local_listen_port: Option<u16>,
+
     pub metadata_size: Option<u32>,
-    #[serde(skip_serializing, flatten)]
-    pub _data: serde_json::Value,
+    #[serde(rename = "reqq")]
+    pub max_outstanding_requests: Option<u32>,
+    #[serde(rename = "v")]
+    pub version: Option<String>,
+    #[serde(skip, rename = "yourip")]
+    pub your_ip: Option<std::net::IpAddr>,
+    #[serde(skip)]
+    pub ipv6: Option<std::net::Ipv6Addr>,
+    #[serde(skip)]
+    pub ipv4: Option<std::net::Ipv4Addr>,
+    // #[serde(skip_serializing, flatten)]
+    // pub _data: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -270,8 +282,13 @@ impl ExtensionHandshakeMessage {
                 ut_metadata: 1,
                 ut_pex: None,
             },
+            local_listen_port: None,
             metadata_size: None,
-            _data: serde_json::Value::Null,
+            max_outstanding_requests: None,
+            version: None,
+            your_ip: None,
+            ipv6: None,
+            ipv4: None,
         }
     }
 }
@@ -282,7 +299,7 @@ impl MessageSerialization for ExtensionHandshakeMessage {
     }
 
     fn deserialize(data: &[u8]) -> Result<Self> {
-        decode_bencode(data)
+        serde_bencode::from_bytes(data).map_err(Into::into)
     }
 }
 
@@ -390,7 +407,7 @@ impl MessageSerialization for ExtensionPieceRequestMessage {
     }
 
     fn deserialize(data: &[u8]) -> Result<Self> {
-        let mut payload: Self = serde_bencode::from_bytes(data)?;
+        let mut payload: Self = decode_bencode(data)?;
 
         if payload.total_size > 0 {
             let piece_data = &data[(data.len() - (payload.total_size as usize))..];

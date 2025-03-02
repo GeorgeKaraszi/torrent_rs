@@ -114,6 +114,14 @@ impl PeerConnection {
         self.metadata_id.expect("metadata id not set")
     }
 
+    pub fn requires_handshake(&self) -> bool {
+        self.peer_id.is_none()
+    }
+
+    pub fn requires_extension_exchange(&self) -> bool {
+        self.requires_handshake() || self.metadata_id.is_none()
+    }
+
     pub async fn send_handshake(
         &mut self,
         info_hash: HashId,

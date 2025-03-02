@@ -1,3 +1,4 @@
+use crate::peer::PeerConnection;
 use crate::torrent::TorrentInfo;
 use crate::tracker::Tracker;
 use crate::types::{HashId, PeerId};
@@ -78,8 +79,24 @@ impl Magnet {
         Ok(self.tracker())
     }
 
-    pub async fn store_torrent_info(&mut self, torrent_info: &TorrentInfo) -> Result<&TorrentInfo> {
-        self.torrent_info = Some(torrent_info.clone());
-        Ok(self.torrent_info())
+    pub async fn handshake(&self, peer: &mut PeerConnection) -> Result<()> {
+        if peer.requires_handshake() {
+            peer.send_handshake(self.info_hash.clone(), true).await?;
+        }
+
+        if peer.requires_extension_exchange() {
+            peer.exchange_magnet_info().await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn retrieve_magnet_info(&mut self, peer: &mut PeerConnection) -> Result<()> {
+        self.handshake(peer).await?;
+
+        let request = peer.request_magnet_torrent_info().await?;
+        self.torrent_info = Some(request.message.payload.torrent_info().clone());
+
+        Ok(())
     }
 }
