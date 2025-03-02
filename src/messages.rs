@@ -1,9 +1,9 @@
 use crate::torrent::TorrentInfo;
 use crate::types::{HashId, PeerId, Result};
 use crate::{decode_bencode, PEER_ID};
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use std::fmt::Debug;
-
+use std::io::{Cursor, Read};
 // ----------------- CONSTANTS & TYPE ALIASES -----------------
 
 pub type PeerMessageBuffer = PeerMessage<Vec<u8>>;
@@ -31,6 +31,7 @@ pub enum MessageTag {
     Request = 6,
     Piece = 7,
     Cancel = 8,
+    RejectRequest = 16,
     Extension = 20,
 }
 
@@ -123,16 +124,17 @@ pub struct ExtensionPieceRequestMessage {
 impl MessageTag {
     pub fn from_u8(tag: u8) -> Result<Self> {
         match tag {
-            0 => Ok(Self::Choke),
-            1 => Ok(Self::Unchoke),
-            2 => Ok(Self::Interested),
-            3 => Ok(Self::NotInterested),
-            4 => Ok(Self::Have),
-            5 => Ok(Self::Bitfield),
-            6 => Ok(Self::Request),
-            7 => Ok(Self::Piece),
-            8 => Ok(Self::Cancel),
-            20 => Ok(Self::Extension),
+            x if x == Self::Choke as u8 => Ok(Self::Choke),
+            x if x == Self::Unchoke as u8 => Ok(Self::Unchoke),
+            x if x == Self::Interested as u8 => Ok(Self::Interested),
+            x if x == Self::NotInterested as u8 => Ok(Self::NotInterested),
+            x if x == Self::Have as u8 => Ok(Self::Have),
+            x if x == Self::Bitfield as u8 => Ok(Self::Bitfield),
+            x if x == Self::Request as u8 => Ok(Self::Request),
+            x if x == Self::Piece as u8 => Ok(Self::Piece),
+            x if x == Self::Cancel as u8 => Ok(Self::Cancel),
+            x if x == Self::RejectRequest as u8 => Ok(Self::RejectRequest),
+            x if x == Self::Extension as u8 => Ok(Self::Extension),
             _ => anyhow::bail!("Unknown tag {}", tag),
         }
     }
@@ -210,12 +212,13 @@ where
     }
 
     fn deserialize(data: &[u8]) -> Result<Self> {
-        // let mut length_bytes = [0u8; 4];
-        // length_bytes.copy_from_slice(&data[..4]);
-        let length = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize - 1;
+        let mut cursor = Cursor::new(data);
+        let length = cursor.get_u32() as usize - 1;
 
-        let message_tag = MessageTag::from_u8(data[4])?;
-        let payload_data = &data[5..5 + length];
+        let message_tag = MessageTag::from_u8(cursor.get_u8())?;
+
+        let mut payload_data = vec![0; length];
+        cursor.read_exact(&mut payload_data)?;
 
         anyhow::ensure!(
             payload_data.len() == length,
@@ -224,7 +227,7 @@ where
             payload_data.len()
         );
 
-        let payload = T::deserialize(&data[5..])?;
+        let payload = T::deserialize(&payload_data)?;
 
         Ok(Self::new(message_tag, payload))
     }
@@ -367,9 +370,12 @@ impl MessageSerialization for PieceMessage {
     }
 
     fn deserialize(data: &[u8]) -> Result<Self> {
-        let index = u32::from_be_bytes(data[..4].try_into().unwrap());
-        let begin = u32::from_be_bytes(data[4..8].try_into().unwrap());
-        let block = data[8..].to_vec();
+        let mut cursor = Cursor::new(data);
+        let index = cursor.get_u32();
+        let begin = cursor.get_u32();
+        let mut block = Vec::new();
+        cursor.read_to_end(&mut block)?;
+
         Ok(Self::new(index, begin, block))
     }
 }
