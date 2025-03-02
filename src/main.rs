@@ -58,6 +58,12 @@ enum Command {
         magnet: String,
         piece_index: usize,
     },
+    #[command(name = "magnet_download")]
+    MagnetDownload {
+        #[arg(short, long)] // Allows both `-o` and `--output`
+        output: PathBuf,
+        magnet: String,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -274,7 +280,6 @@ async fn download_magnet_piece(magnet: String, piece_index: usize) -> anyhow::Re
     let tracker = magnet.discover_peers(PEER_ID).await?;
     let mut peer = PeerConnection::connect(&tracker.peers[0]).await?;
 
-
     magnet.retrieve_magnet_info(&mut peer).await?;
     peer.send_interest().await?;
 
@@ -307,6 +312,91 @@ async fn download_magnet_piece(magnet: String, piece_index: usize) -> anyhow::Re
     }
 
     Ok(block_data)
+}
+
+async fn download_magnet_file_piece(
+    peer: Peer,
+    magnet: &Magnet,
+    pieces: Vec<(usize, HashId)>,
+) -> Result<Vec<(usize, Vec<u8>)>> {
+    let mut block_collection: Vec<(usize, Vec<u8>)> = Vec::with_capacity(pieces.len());
+    let torrent_info = magnet.torrent_info();
+    let mut peer = PeerConnection::connect(&peer).await?;
+    {
+        magnet.handshake(&mut peer).await?;
+        peer.send_interest().await?;
+    }
+
+    for (idx, piece_hash) in pieces {
+        let piece_size = torrent_info.calculate_piece_size(idx);
+        let num_of_blocks = (piece_size + (BLOCK_MAX - 1)) / BLOCK_MAX;
+
+        let mut block_data = Vec::with_capacity(piece_size);
+
+        for block in 0..num_of_blocks {
+            let block_size = calculate_block_size(piece_size, block, num_of_blocks);
+
+            let piece = peer
+                .download_piece(idx as u32, (block * BLOCK_MAX) as u32, block_size as u32)
+                .await?;
+
+            block_data.extend_from_slice(piece.message.block());
+        }
+
+        {
+            let mut hasher = Sha1::new();
+            hasher.update(&block_data);
+            let hasher: HashId = hasher.finalize().try_into().expect("hashing failed");
+            ensure!(hasher == piece_hash);
+        }
+
+        block_collection.push((idx, block_data));
+    }
+
+    Ok(block_collection)
+}
+
+async fn download_magnet_file(magnet: String) -> Result<Vec<u8>> {
+    let mut magnet = Magnet::from_str(magnet.as_str())?;
+    let tracker = magnet.discover_peers(PEER_ID).await?.clone();
+    {
+        let mut peer = PeerConnection::connect(&tracker.peers[0]).await?;
+        magnet.retrieve_magnet_info(&mut peer).await?;
+    }
+
+    let torrent_info = magnet.torrent_info();
+    let piece_count = torrent_info.pieces.len();
+    let peer_count = tracker.peers.len();
+    let mut piece_distribution: HashMap<usize, Vec<(usize, HashId)>> = HashMap::new();
+
+    for (peer_idx, i) in (0..peer_count).cycle().zip(0..piece_count) {
+        piece_distribution
+            .entry(peer_idx)
+            .or_insert(vec![])
+            .push((i, torrent_info.pieces[i]));
+    }
+
+    let mut async_pieces = Vec::with_capacity(peer_count);
+
+    for (peer_idx, pieces) in piece_distribution {
+        let peer = tracker.peers[peer_idx].clone();
+        let async_piece = download_magnet_file_piece(peer, &magnet, pieces);
+        async_pieces.push(async_piece);
+    }
+
+    let block_pieces = futures::future::try_join_all(async_pieces)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect::<HashMap<usize, Vec<u8>>>();
+
+    let collected_pieces = (0..torrent_info.pieces.len())
+        .filter_map(|i| block_pieces.get(&i))
+        .flatten()
+        .cloned()
+        .collect();
+
+    Ok(collected_pieces)
 }
 
 #[tokio::main]
@@ -386,6 +476,15 @@ async fn main() -> anyhow::Result<()> {
             piece_index,
         } => {
             let raw_file_data = download_magnet_piece(magnet, piece_index).await?;
+
+            tokio::fs::write(output.clone(), raw_file_data)
+                .await
+                .expect("writing file");
+
+            println!("downloaded to: {}", output.display());
+        }
+        Command::MagnetDownload { output, magnet } => {
+            let raw_file_data = download_magnet_file(magnet).await?;
 
             tokio::fs::write(output.clone(), raw_file_data)
                 .await
