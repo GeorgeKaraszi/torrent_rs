@@ -39,6 +39,19 @@ impl TorrentInfo {
 
         encoded
     }
+
+    pub fn calculate_piece_size(&self, index: usize) -> usize {
+        if index == self.pieces.len() - 1 {
+            let remainder = self.length % self.piece_length;
+            if remainder == 0 {
+                self.piece_length
+            } else {
+                remainder
+            }
+        } else {
+            self.piece_length
+        }
+    }
 }
 
 impl Deref for PiecesHashes {

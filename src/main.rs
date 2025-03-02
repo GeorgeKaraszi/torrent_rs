@@ -1,18 +1,16 @@
-use anyhow::{ensure, Context, Error};
+use anyhow::ensure;
 use clap::{Parser, Subcommand};
 use codecrafters_bittorrent::magnet::*;
 use codecrafters_bittorrent::peer::*;
-use codecrafters_bittorrent::peer_v2 as p2;
+use codecrafters_bittorrent::messages::PeerHandshake;
 use codecrafters_bittorrent::torrent::{Torrent, TorrentInfo};
 use codecrafters_bittorrent::tracker::{TackerRequest, Tracker};
-use codecrafters_bittorrent::types::HashId;
+use codecrafters_bittorrent::types::{HashId, Result};
 use codecrafters_bittorrent::{convert, PEER_ID};
 use futures::{SinkExt, StreamExt};
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 const BLOCK_MAX: usize = 1 << 14;
 
@@ -92,40 +90,35 @@ async fn fetch_tracker_info(torrent: &Torrent) -> anyhow::Result<Tracker> {
     Ok(response)
 }
 
-async fn handshake_from_peer(
-    info_hash: HashId,
-    peer: String,
-) -> anyhow::Result<PeerHandshake, Error> {
-    let mut connection = TcpStream::connect(peer)
+// Note: This test for CodeCrafters doesn't send bitfield messages during testing.
+// Hence, why PeerConnection::send_handshake doesn't work.
+async fn handshake_from_peer(info_hash: HashId, peer: String) -> Result<()> {
+    let peer = Peer::new(peer.as_str());
+    let peer = PeerConnection::connect(&peer).await?;
+    let mut connection = peer.connection.lock().unwrap();
+
+    connection
+        .send(PeerHandshake::new(Some(info_hash), None, false))
+        .await?;
+
+    let handshake = connection
+        .next()
         .await
-        .expect("Failed to connect to peer");
+        .expect("peer sending handshake")?
+        .expect_handshake()?;
 
-    let mut handshake = PeerHandshake::new(info_hash);
-
-    {
-        let handshake_bytes = handshake.mut_ptr();
-
-        connection
-            .write_all(handshake_bytes)
-            .await
-            .context("Write Handshake")?;
-
-        connection
-            .read_exact(handshake_bytes)
-            .await
-            .context("Read Handshake")?;
-    }
-
-    let reserved = handshake.reserved.clone();
-    let ext_id = reserved[reserved.len() - 1];
-    println!("EXT ID: {}", ext_id);
-    println!("Reserved: {:?}", reserved);
+    anyhow::ensure!(&handshake.peer_id != PEER_ID);
+    anyhow::ensure!(handshake.protocol_length == 19, "Invalid protocol length");
+    anyhow::ensure!(
+        &handshake.protocol == b"BitTorrent protocol",
+        "Invalid protocol"
+    );
 
     println!("Peer ID: {}", hex::encode(handshake.peer_id));
-    Ok(handshake)
+    Ok(())
 }
 
-fn read_torrent_file(torrent: PathBuf) -> anyhow::Result<Torrent> {
+fn read_torrent_file(torrent: PathBuf) -> Result<Torrent> {
     let file = std::fs::read(torrent)?;
     let torrent = serde_bencode::from_bytes::<Torrent>(&file.as_slice())?;
     Ok(torrent)
@@ -135,7 +128,7 @@ async fn download_peer_piece(
     torrent: Torrent,
     tracker_response: Tracker,
     piece_index: usize,
-) -> anyhow::Result<Vec<u8>> {
+) -> Result<Vec<u8>> {
     let peer = tracker_response.peers[0].clone();
 
     let piece_setup: Vec<(usize, HashId)> = vec![(piece_index, torrent.info.pieces[piece_index])];
@@ -144,19 +137,6 @@ async fn download_peer_piece(
     // Attempting to resist the urge to clone the data. Seems like it'd otherwise start being expensive long term.
     let block = piece_block.into_iter().next().expect("block exists").1;
     Ok(block)
-}
-
-fn calculate_piece_size(torrent_info: &TorrentInfo, piece_index: usize) -> usize {
-    if piece_index == torrent_info.pieces.len() - 1 {
-        let remainder = torrent_info.length % torrent_info.piece_length;
-        if remainder == 0 {
-            torrent_info.piece_length
-        } else {
-            remainder
-        }
-    } else {
-        torrent_info.piece_length
-    }
 }
 
 fn calculate_block_size(piece_size: usize, block_index: usize, num_of_blocks: usize) -> usize {
@@ -173,56 +153,30 @@ fn calculate_block_size(piece_size: usize, block_index: usize, num_of_blocks: us
 }
 
 async fn download_pieces(
-    peer: p2::Peer,
+    peer: Peer,
     torrent_info: &TorrentInfo,
     pieces: Vec<(usize, HashId)>,
 ) -> anyhow::Result<Vec<(usize, Vec<u8>)>> {
-    let mut peer = PeerConnection::connect(Peer {
-        ip: peer.ip,
-        port: peer.port,
-    })
-    .await?;
+    let mut peer = PeerConnection::connect(&peer).await?;
     peer.send_handshake(torrent_info.hash(), false).await?;
-    peer.send_interested().await?;
-
-    let mut peer_connection = peer.connection.try_lock().expect("connection is locked");
+    peer.send_interest().await?;
 
     let mut block_collection: Vec<(usize, Vec<u8>)> = Vec::with_capacity(pieces.len());
 
     for (idx, piece_hash) in pieces {
-        let piece_size = calculate_piece_size(&torrent_info, idx);
+        let piece_size = torrent_info.calculate_piece_size(idx);
         let num_of_blocks = (piece_size + (BLOCK_MAX - 1)) / BLOCK_MAX;
 
         let mut block_data = Vec::with_capacity(piece_size);
 
         for block in 0..num_of_blocks {
             let block_size = calculate_block_size(piece_size, block, num_of_blocks);
-            let request =
-                PeerMessage::request(idx as u32, (block * BLOCK_MAX) as u32, block_size as u32);
 
-            peer_connection
-                .send(PeerFrame::Message(request))
-                .await
-                .context("Sending request message")?;
+            let piece = peer
+                .download_piece(idx as u32, (block * BLOCK_MAX) as u32, block_size as u32)
+                .await?;
 
-            let piece = peer_connection
-                .next()
-                .await
-                .expect("Peer returns a piece")
-                .context("peer message was invalid")?
-                .expect_message();
-
-            ensure!(piece.message_tag == MessageTag::Piece);
-            ensure!(!piece.payload.is_empty());
-
-            let piece = Piece::from_bytes(&piece.payload[..])
-                .expect("always returning pieces from the peers");
-
-            ensure!(piece.index() as usize == idx);
-            ensure!(piece.begin() as usize == block * BLOCK_MAX);
-            ensure!(piece.block().len() == block_size);
-
-            block_data.extend(piece.block());
+            block_data.extend_from_slice(piece.message.block());
         }
 
         {
@@ -276,7 +230,7 @@ async fn download_file(torrent: Torrent, tracker: Tracker) -> anyhow::Result<Vec
 async fn magnet_handshake(magnet: String) -> anyhow::Result<()> {
     let mut magnet = Magnet::from_str(magnet.as_str())?;
     let tracker = magnet.discover_peers(PEER_ID).await?;
-    let mut peer = p2::PeerConnection::connect(&tracker.peers[0]).await?;
+    let mut peer = PeerConnection::connect(&tracker.peers[0]).await?;
 
     peer.send_handshake(magnet.info_hash.clone(), true).await?;
     peer.exchange_magnet_info().await?;
@@ -290,7 +244,7 @@ async fn magnet_handshake(magnet: String) -> anyhow::Result<()> {
 async fn magnet_info(magnet: String) -> anyhow::Result<()> {
     let mut magnet = Magnet::from_str(magnet.as_str())?;
     let tracker = magnet.discover_peers(PEER_ID).await?;
-    let mut peer = p2::PeerConnection::connect(&tracker.peers[0]).await?;
+    let mut peer = PeerConnection::connect(&tracker.peers[0]).await?;
 
     peer.send_handshake(magnet.info_hash.clone(), true).await?;
     peer.exchange_magnet_info().await?;

@@ -1,27 +1,30 @@
-// ----------------- IMPORTS -----------------
-use crate::types::{HashId, PeerId};
-use crate::{decode_bencode, PEER_ID};
-use anyhow::{anyhow, ensure, Context, Error};
-use bytes::{Buf, BufMut, BytesMut};
+use crate::messages::*;
+use crate::types::{HashId, PeerId, Result};
+use crate::PEER_ID;
+use anyhow::{Context, Error};
+use bytes::{Buf, BytesMut};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Deserializer};
-use std::fmt;
-use std::mem::size_of;
+use std::fmt::Debug;
 use std::net::{IpAddr, Ipv4Addr};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 use tokio_util::codec::{Decoder, Encoder, Framed};
-
 // ----------------- CONSTANTS & TYPE ALIASES -----------------
+
 const HANDSHAKE_LENGTH: usize = size_of::<PeerHandshake>(); // 68
 const MAX_MESSAGE_LENGTH: usize = 1 << 16;
+
+trait SendableMessage {}
+impl SendableMessage for PeerHandshake {}
+impl<T> SendableMessage for PeerMessage<T> where T: MessageSerialization {}
 
 // ----------------- CORE PEER STRUCTS -----------------
 #[derive(Debug, Clone)]
 pub struct Peers(Vec<Peer>);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Peer {
     pub ip: IpAddr,
     pub port: u16,
@@ -35,132 +38,7 @@ pub struct PeerConnection {
     pub connection: Arc<Mutex<Framed<TcpStream, PeerCodec>>>,
 }
 
-// ----------------- NETWORKING & PROTOCOL -----------------
-
-#[repr(C)]
-#[derive(Debug, Clone)]
-pub struct PeerHandshake {
-    pub protocol_length: u8,
-    pub protocol: [u8; 19],
-    pub reserved: [u8; 8],
-    pub info_hash: HashId,
-    pub peer_id: PeerId,
-}
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct PeerMessage {
-    pub message_tag: MessageTag,
-    pub payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PeerPayloadMessage<T: MessageSerialize> {
-    pub metadata_id: u8,
-    pub payload: T,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ExtensionRequest {
-    pub msg_type: u8,
-    pub piece: u8,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ExtensionRequestResponse {
-    #[serde(flatten)]
-    pub data: serde_json::Value,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ExtensionHandshake {
-    #[serde(rename = "m")]
-    pub metadata: ExtensionDirectory,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata_size: Option<u32>,
-    #[serde(skip_serializing)]
-    #[serde(flatten)]
-    pub _data: serde_json::Value,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ExtensionDirectory {
-    pub ut_metadata: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ut_pex: Option<u8>,
-}
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct RequestMessage {
-    index: [u8; 4],
-    begin: [u8; 4],
-    length: [u8; 4],
-}
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct Piece<T: ?Sized = [u8]> {
-    index: [u8; 4],
-    begin: [u8; 4],
-    block: T,
-}
-
-// ----------------- ENCODING & DECODING -----------------
-pub struct PeerCodec {
-    pub state: CodecState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum PeerMessageExtensionTag {
-    Handshake = 0,
-    Request = 1,
-    Data = 2,
-    Reject = 3,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum MessageTag {
-    Choke = 0,
-    Unchoke = 1,
-    Interested = 2,
-    NotInterested = 3,
-    Have = 4,
-    Bitfield = 5,
-    Request = 6,
-    Piece = 7,
-    Cancel = 8,
-    Extension = 20,
-    UNKNOWN = 9,
-}
-
-#[derive(Debug)]
-pub enum PeerFrame {
-    Handshake(PeerHandshake),
-    Message(PeerMessage),
-}
-
-#[derive(Debug, PartialEq)]
-pub enum CodecState {
-    WaitingHandshake,
-    Messages,
-}
-
-pub trait MessagePayloadEncoder {
-    fn encode(&self) -> Vec<u8>;
-}
-
-pub trait MessagePayloadDecoder: Sized {
-    fn decode(bytes: &[u8]) -> Result<Self, Error>;
-}
-
-pub trait MessageOwned: Sized + MessagePayloadEncoder + MessagePayloadDecoder {}
-pub trait MessageSerialize: serde::Serialize + serde::de::DeserializeOwned {}
-
-impl<T> MessageOwned for T where T: MessagePayloadEncoder + MessagePayloadDecoder {}
-impl<T> MessageSerialize for T where T: serde::Serialize + serde::de::DeserializeOwned {}
+// ---------------------- PEER  ----------------------
 
 impl Deref for Peers {
     type Target = Vec<Peer>;
@@ -171,7 +49,7 @@ impl Deref for Peers {
 }
 
 impl<'de> Deserialize<'de> for Peers {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -198,199 +76,203 @@ impl<'de> Deserialize<'de> for Peers {
 }
 
 impl Peer {
+    pub fn new(ip_address: &str) -> Self {
+        let mut parts = ip_address.split(':');
+        let ip = parts.next().unwrap().parse().unwrap();
+        let port = parts.next().unwrap().parse().unwrap();
+
+        Self { ip, port }
+    }
+
     pub fn ip_address(&self) -> String {
         format!("{}:{}", self.ip, self.port)
     }
 }
 
-impl fmt::Debug for PeerConnection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PeerConnection")
-            .field("peer", &self.peer)
-            .field("connection", &"Framed<TcpStream, PeerCodec>")
-            .finish()
-    }
-}
+// ----------------- PEER CONNECTION -----------------
 
 impl PeerConnection {
-    pub async fn connect(peer: Peer) -> anyhow::Result<Self, Error> {
-        let connection = TcpStream::connect(peer.ip_address())
-            .await
-            .context("Failed to connect to peer")?;
+    pub async fn connect(peer: &Peer) -> Result<Self> {
+        let addr = peer.ip_address();
+        let stream = TcpStream::connect(addr).await?;
+        let codec = PeerCodec::new();
+        let framed = Framed::new(stream, codec);
 
         Ok(Self {
-            peer: peer,
+            peer: peer.clone(),
             peer_id: None,
             metadata_id: None,
-            connection: Arc::new(Mutex::new(Framed::new(connection, PeerCodec::new()))),
+            connection: Arc::new(Mutex::new(framed)),
         })
     }
 
     pub fn peer_id(&self) -> PeerId {
-        match self.peer_id {
-            Some(peer_id) => peer_id,
-            None => panic!("Peer ID is not set you must send a handshake first"),
-        }
+        self.peer_id.expect("peer id not set")
     }
 
     pub fn metadata_id(&self) -> u8 {
-        match self.metadata_id {
-            Some(metadata_id) => metadata_id,
-            None => panic!("Metadata ID is not set you must send an extension handshake first"),
-        }
+        self.metadata_id.expect("metadata id not set")
     }
 
     pub async fn send_handshake(
         &mut self,
         info_hash: HashId,
         extension: bool,
-    ) -> anyhow::Result<PeerHandshake, Error> {
-        let mut connection = self.connection.lock().expect("connection is locked");
+    ) -> Result<PeerHandshake> {
+        let mut connection = self.connection.lock().unwrap();
 
-        let handshake = if extension {
-            PeerHandshake::new_ext(info_hash)
-        } else {
-            PeerHandshake::new(info_hash)
-        };
+        connection
+            .send(PeerHandshake::new(Some(info_hash), None, extension))
+            .await?;
 
-        connection.send(PeerFrame::Handshake(handshake)).await?;
-
-        let peer_handshake = connection
+        let handshake = connection
             .next()
             .await
-            .expect("peer always sends handshake")
-            .context("peer handshake was invalid")?
-            .expect_handshake();
+            .expect("peer sending handshake")?
+            .expect_handshake()?;
 
-        ensure!(peer_handshake.protocol_length == 19);
-        ensure!(&peer_handshake.protocol == b"BitTorrent protocol");
-        ensure!(&peer_handshake.peer_id != PEER_ID);
+        anyhow::ensure!(&handshake.peer_id != PEER_ID);
+        anyhow::ensure!(handshake.protocol_length == 19, "Invalid protocol length");
+        anyhow::ensure!(
+            &handshake.protocol == b"BitTorrent protocol",
+            "Invalid protocol"
+        );
 
         let bitfield = connection
             .next()
             .await
-            .expect("peer always sends bitfields")
-            .context("peer message was invalid")?
-            .expect_message();
+            .expect("peer always submits bitfield after handshake")
+            .context("peer bitfield message is invalid")?
+            .unwrap_message();
 
-        ensure!(bitfield.message_tag == MessageTag::Bitfield);
+        anyhow::ensure!(
+            bitfield.message_tag == MessageTag::Bitfield,
+            "Invalid bitfield message"
+        );
 
-        self.peer_id = Some(peer_handshake.peer_id);
+        self.peer_id = Some(handshake.peer_id.clone());
 
-        Ok(peer_handshake)
+        Ok(handshake)
     }
 
-    pub async fn send_extension<T, D>(
-        &mut self,
-        message: PeerPayloadMessage<T>,
-    ) -> anyhow::Result<PeerPayloadMessage<D>, Error>
-    where
-        T: MessageSerialize,
-        D: MessageSerialize,
-    {
-        let mut connection = self.connection.lock().expect("connection is locked");
+    pub async fn send_interest(&mut self) -> Result<PeerMessageBuffer> {
+        let mut connection = self.connection.lock().unwrap();
 
         connection
-            .send(PeerFrame::Message(PeerMessage::extension_message(message)))
+            .send(PeerMessage::new(MessageTag::Interested, vec![]))
             .await?;
 
-        let peer_ext = connection
+        let message: PeerMessageBuffer = connection
             .next()
             .await
-            .expect("peer always sends extension")
-            .context("peer message was invalid")?
-            .expect_message();
+            .expect("peer responses with unchoked message")
+            .context("peer unchoked message is invalid")?
+            .expect_message()?;
 
-        ensure!(peer_ext.message_tag == MessageTag::Extension);
-
-        peer_ext.decode::<PeerPayloadMessage<D>>()
+        anyhow::ensure!(message.message_tag == MessageTag::Unchoke);
+        anyhow::ensure!(message.message.is_empty());
+        Ok(message)
     }
 
-    pub async fn send_extension_handshake(
+    pub async fn download_piece(
         &mut self,
-    ) -> anyhow::Result<PeerPayloadMessage<ExtensionHandshake>, Error> {
-        let message = PeerPayloadMessage::<ExtensionHandshake>::new();
-        let peer_handshake = self
-            .send_extension::<ExtensionHandshake, ExtensionHandshake>(message)
-            .await?;
-        self.metadata_id = Some(peer_handshake.payload.metadata.ut_metadata);
-        Ok(peer_handshake)
-    }
-
-    pub async fn send_metadata_request(
-        &mut self,
-    ) -> anyhow::Result<PeerPayloadMessage<ExtensionRequestResponse>, Error> {
-        let message = PeerPayloadMessage::<ExtensionRequest>::new(self.metadata_id());
-
-        let response = self
-            .send_extension::<ExtensionRequest, ExtensionRequestResponse>(message)
-            .await?;
-        Ok(response)
-    }
-
-    pub async fn send_interested(&mut self) -> anyhow::Result<(), Error> {
-        let mut connection = self.connection.lock().expect("connection is locked");
+        index: u32,
+        begin: u32,
+        length: u32,
+    ) -> Result<PeerMessage<PieceMessage>> {
+        let mut connection = self.connection.lock().unwrap();
+        let request = PieceRequestMessage::new(index, begin, length);
 
         connection
-            .send(PeerFrame::Message(PeerMessage::interested()))
-            .await?;
+            .send(PeerMessage::new(MessageTag::Request, request.clone()))
+            .await
+            .context("Sending piece request message")?;
 
-        let unchoked = connection
+        let piece_message: PeerMessage<PieceMessage> = connection
             .next()
             .await
-            .expect("peer responses with unchoked")
+            .expect("peer always sends extension response")
             .context("peer message was invalid")?
-            .expect_message();
+            .expect_message()?;
 
-        ensure!(unchoked.message_tag == MessageTag::Unchoke);
-        ensure!(unchoked.payload.is_empty());
-        Ok(())
+        anyhow::ensure!(piece_message.message_tag == MessageTag::Piece);
+        anyhow::ensure!(piece_message.message.index() == request.index());
+        anyhow::ensure!(piece_message.message.begin() == request.begin());
+        anyhow::ensure!(piece_message.message.length() == request.length());
+
+        Ok(piece_message)
+    }
+
+    pub async fn exchange_magnet_info(
+        &mut self,
+    ) -> Result<PeerExtMessageBuffer<ExtensionHandshakeMessage>> {
+        let mut connection = self.connection.lock().unwrap();
+
+        let peer_ext_message =
+            ExtensionPayload::new(0, ExtensionHandshakeMessage::default()).into_peer_message();
+
+        connection
+            .send(peer_ext_message)
+            .await
+            .context("Sending extension handshake")?;
+
+        let handshake_extension = connection
+            .next()
+            .await
+            .expect("peer always sends extension response")
+            .context("peer message was invalid")?
+            .expect_extension_message::<ExtensionHandshakeMessage>()?;
+
+        anyhow::ensure!(handshake_extension.message_tag == MessageTag::Extension);
+
+        self.metadata_id = Some(handshake_extension.message.payload.metadata.ut_metadata);
+
+        Ok(handshake_extension)
+    }
+
+    pub async fn request_magnet_torrent_info(
+        &mut self,
+    ) -> Result<PeerExtMessageBuffer<ExtensionPieceRequestMessage>> {
+        let mut connection = self.connection.lock().unwrap();
+
+        let extension_payload =
+            ExtensionPayload::new(self.metadata_id(), ExtensionPieceRequestMessage::default())
+                .into_peer_message();
+
+        connection
+            .send(extension_payload)
+            .await
+            .context("Sending ExtensionPieceRequestMessage message")?;
+
+        let extension_message = connection
+            .next()
+            .await
+            .expect("peer always sends extension response")
+            .context("peer message was invalid")?
+            .expect_extension_message::<ExtensionPieceRequestMessage>()?;
+
+        anyhow::ensure!(extension_message.message_tag == MessageTag::Extension);
+
+        Ok(extension_message)
     }
 }
 
-impl PeerMessage {
-    fn new(message_tag: MessageTag, payload: Vec<u8>) -> Self {
-        Self {
-            message_tag: message_tag,
-            payload: payload,
-        }
-    }
+// ----------------- CODEC -----------------
 
-    pub fn new_message<T>(message_tag: MessageTag, payload: T) -> Self
-    where
-        T: MessageOwned,
-    {
-        Self::new(message_tag, payload.encode())
-    }
+#[derive(Debug)]
+pub enum PeerFrame {
+    Handshake(PeerHandshake),
+    Message(PeerMessageBuffer),
+}
 
-    pub fn new_buffer(capacity: Option<usize>) -> Self {
-        let capacity = capacity.unwrap_or(1024);
-        let payload: Vec<u8> = Vec::with_capacity(capacity);
-        Self::new(MessageTag::UNKNOWN, payload)
-    }
+#[derive(Debug, PartialEq)]
+pub enum CodecState {
+    WaitingHandshake,
+    Messages,
+}
 
-    pub fn interested() -> Self {
-        Self::new(MessageTag::Interested, vec![])
-    }
-
-    pub fn request(index: u32, begin: u32, length: u32) -> Self {
-        let request = RequestMessage::new(index, begin, length);
-        Self::new_message(MessageTag::Request, request)
-    }
-
-    pub fn extension_message<T>(payload: PeerPayloadMessage<T>) -> Self
-    where
-        T: MessageSerialize,
-    {
-        Self::new_message(MessageTag::Extension, payload)
-    }
-
-    pub fn decode<T>(&self) -> Result<T, Error>
-    where
-        T: MessageOwned,
-    {
-        T::decode(self.payload.as_slice())
-    }
+pub struct PeerCodec {
+    pub state: CodecState,
 }
 
 impl PeerCodec {
@@ -401,34 +283,64 @@ impl PeerCodec {
     }
 }
 
+impl PeerFrame {
+    pub fn expect_handshake(self) -> Result<PeerHandshake> {
+        match self {
+            PeerFrame::Handshake(handshake) => Ok(handshake),
+            _ => anyhow::bail!("Expected PeerFrame::Handshake got {:#?}", self),
+        }
+    }
+
+    pub fn expect_message<T>(self) -> Result<PeerMessage<T>>
+    where
+        T: MessageSerialization + Debug,
+    {
+        match self {
+            PeerFrame::Message(message) => message.convert::<T>(),
+            _ => anyhow::bail!("Expected PeerFrame::Message got {:#?}", self),
+        }
+    }
+
+    pub fn expect_extension_message<T>(self) -> Result<PeerMessage<ExtensionPayload<T>>>
+    where
+        T: MessageSerialization + Debug,
+    {
+        self.expect_message::<ExtensionPayload<T>>()
+    }
+
+    pub fn unwrap_message(self) -> PeerMessageBuffer {
+        match self {
+            PeerFrame::Message(message) => message,
+            _ => panic!("Expected PeerFrame::Message got {:#?}", self),
+        }
+    }
+}
+
 impl Decoder for PeerCodec {
     type Item = PeerFrame;
     type Error = Error;
 
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
         match self.state {
             CodecState::WaitingHandshake => {
                 if src.len() < HANDSHAKE_LENGTH {
                     return Ok(None);
                 }
 
-                let mut peer_handshake = PeerHandshake::new_peer();
-                peer_handshake
-                    .mut_ptr()
-                    .copy_from_slice(&src[..HANDSHAKE_LENGTH]);
+                let handshake =
+                    <PeerHandshake as MessageSerialization>::deserialize(&src[..HANDSHAKE_LENGTH])?;
                 src.advance(HANDSHAKE_LENGTH);
 
                 self.state = CodecState::Messages;
-                Ok(Some(PeerFrame::Handshake(peer_handshake)))
+                Ok(Some(PeerFrame::Handshake(handshake)))
             }
             CodecState::Messages => {
                 if src.len() < 4 {
                     return Ok(None);
                 }
 
-                let mut length_bytes = [0u8; 4];
-                length_bytes.copy_from_slice(&src[..4]);
-                let length = u32::from_be_bytes(length_bytes) as usize;
+                let length = u32::from_be_bytes(src[..4].try_into().unwrap()) as usize;
+                let message_length = length + 4;
 
                 if length == 0 {
                     src.advance(4);
@@ -440,39 +352,21 @@ impl Decoder for PeerCodec {
                 }
 
                 if length > MAX_MESSAGE_LENGTH {
-                    return Err(anyhow!("Frame of length {} is too large", length));
+                    anyhow::bail!(
+                        "Message length exceeds maximum allowed length: Max {} Got {}",
+                        MAX_MESSAGE_LENGTH,
+                        length
+                    );
                 }
 
-                if src.len() < 4 + length {
-                    src.reserve(4 + length - src.len());
+                if src.len() < message_length {
+                    src.reserve(message_length - src.len());
                     return Ok(None);
                 }
 
-                let message_tag = match src[4] {
-                    0 => MessageTag::Choke,
-                    1 => MessageTag::Unchoke,
-                    2 => MessageTag::Interested,
-                    3 => MessageTag::NotInterested,
-                    4 => MessageTag::Have,
-                    5 => MessageTag::Bitfield,
-                    6 => MessageTag::Request,
-                    7 => MessageTag::Piece,
-                    8 => MessageTag::Cancel,
-                    20 => MessageTag::Extension,
-                    tag => {
-                        return Err(anyhow!("Unknown message tag id: {}", tag));
-                    }
-                };
-
-                let message_payload = if src.len() > 5 {
-                    src[5..4 + length].to_vec()
-                } else {
-                    Vec::new()
-                };
-
-                src.advance(4 + length);
-
-                let peer_message = PeerMessage::new(message_tag, message_payload);
+                let payload = &src[..message_length];
+                let peer_message = PeerMessageBuffer::deserialize(payload)?;
+                src.advance(message_length);
 
                 Ok(Some(PeerFrame::Message(peer_message)))
             }
@@ -480,238 +374,14 @@ impl Decoder for PeerCodec {
     }
 }
 
-impl Encoder<PeerFrame> for PeerCodec {
+impl<T> Encoder<T> for PeerCodec
+where
+    T: MessageSerialization + SendableMessage,
+{
     type Error = Error;
 
-    fn encode(&mut self, item: PeerFrame, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        match item {
-            PeerFrame::Handshake(handshake) => {
-                let bytes = unsafe {
-                    let ptr = &handshake as *const PeerHandshake as *const u8;
-                    std::slice::from_raw_parts(ptr, HANDSHAKE_LENGTH)
-                };
-                dst.reserve(HANDSHAKE_LENGTH);
-                dst.put_slice(bytes);
-                Ok(())
-            }
-            PeerFrame::Message(msg) => {
-                let message_length: [u8; 4] = u32::to_be_bytes(msg.payload.len() as u32 + 1);
-                dst.put_slice(&message_length);
-                dst.put_u8(msg.message_tag as u8);
-                dst.put_slice(&msg.payload);
-                Ok(())
-            }
-        }
-    }
-}
-
-impl PeerFrame {
-    pub fn expect_handshake(self) -> PeerHandshake {
-        match self {
-            PeerFrame::Handshake(handshake) => handshake,
-            _ => panic!("Called `unwrap_handshake()` on a `Message` variant"),
-        }
-    }
-
-    pub fn expect_message(self) -> PeerMessage {
-        match self {
-            PeerFrame::Message(message) => message,
-            _ => panic!("Called `unwrap_message()` on a `Handshake` variant"),
-        }
-    }
-
-    pub fn as_message(&self) -> Option<&PeerMessage> {
-        match self {
-            PeerFrame::Message(message) => Some(message),
-            _ => None,
-        }
-    }
-}
-
-impl PeerHandshake {
-    pub fn default(
-        info_hash: Option<HashId>,
-        peer_id: Option<PeerId>,
-        extension: Option<[u8; 8]>,
-    ) -> Self {
-        let peer_id = peer_id.unwrap_or(*PEER_ID);
-        let info_hash = info_hash.unwrap_or(HashId::default());
-        let reserved = extension.unwrap_or([0u8; 8]);
-
-        Self {
-            protocol_length: 19,
-            protocol: *b"BitTorrent protocol",
-            reserved: reserved,
-            info_hash: info_hash,
-            peer_id: peer_id,
-        }
-    }
-
-    pub fn new(info_hash: HashId) -> Self {
-        Self::default(Some(info_hash), None, None)
-    }
-
-    pub fn new_ext(info_hash: HashId) -> Self {
-        let magnet_ext = (1u64 << 20).to_be_bytes().into();
-        Self::default(Some(info_hash), None, Some(magnet_ext))
-    }
-
-    pub fn new_peer() -> Self {
-        Self::default(None, None, None)
-    }
-
-    pub fn mut_ptr(&mut self) -> &mut [u8; size_of::<Self>()] {
-        let bytes = self as *mut Self as *mut [u8; size_of::<Self>()];
-        let bytes: &mut [u8; size_of::<Self>()] = unsafe { &mut *bytes };
-
-        bytes
-    }
-}
-
-impl<T> PeerPayloadMessage<T>
-where
-    T: MessageSerialize,
-{
-    fn new_message(metadata_id: u8, payload: T) -> Self {
-        Self {
-            metadata_id,
-            payload,
-        }
-    }
-}
-
-impl PeerPayloadMessage<ExtensionHandshake> {
-    pub fn new() -> Self {
-        Self::new_message(0, ExtensionHandshake::new())
-    }
-}
-
-impl PeerPayloadMessage<ExtensionRequest> {
-    pub fn new(metadata_id: u8) -> Self {
-        Self::new_message(metadata_id, ExtensionRequest::new())
-    }
-}
-
-impl<T> MessagePayloadEncoder for PeerPayloadMessage<T>
-where
-    T: MessageSerialize,
-{
-    fn encode(&self) -> Vec<u8> {
-        let encoded_payload = serde_bencode::to_bytes(&self.payload).unwrap();
-        let mut bytes = Vec::with_capacity(encoded_payload.len() + 1);
-        bytes.push(self.metadata_id);
-        bytes.extend_from_slice(&encoded_payload);
-        bytes
-    }
-}
-
-impl<T> MessagePayloadDecoder for PeerPayloadMessage<T>
-where
-    T: MessageSerialize,
-{
-    fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        Ok(Self {
-            metadata_id: bytes[0],
-            payload: decode_bencode(&bytes[1..])?,
-        })
-    }
-}
-
-impl ExtensionHandshake {
-    pub fn new() -> Self {
-        Self {
-            metadata: ExtensionDirectory {
-                ut_metadata: 1,
-                ut_pex: None,
-            },
-            metadata_size: None,
-            _data: serde_json::Value::Null,
-        }
-    }
-}
-
-impl ExtensionRequest {
-    pub fn new() -> Self {
-        Self {
-            msg_type: 0,
-            piece: 0,
-        }
-    }
-}
-
-impl RequestMessage {
-    pub fn new(index: u32, begin: u32, length: u32) -> Self {
-        Self {
-            index: index.to_be_bytes(),
-            begin: begin.to_be_bytes(),
-            length: length.to_be_bytes(),
-        }
-    }
-    pub fn mut_ptr(&mut self) -> &mut [u8; size_of::<Self>()] {
-        let bytes = self as *mut Self as *mut [u8; size_of::<Self>()];
-        let bytes: &mut [u8; size_of::<Self>()] = unsafe { &mut *bytes };
-
-        bytes
-    }
-
-    pub fn as_slice(&self) -> &[u8; size_of::<Self>()] {
-        let bytes = self as *const Self as *const [u8; size_of::<Self>()];
-        let bytes: &[u8; size_of::<Self>()] = unsafe { &*bytes };
-
-        bytes
-    }
-}
-
-impl MessagePayloadEncoder for RequestMessage {
-    fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(size_of::<Self>());
-        bytes.extend_from_slice(self.as_slice());
-        bytes
-    }
-}
-
-impl MessagePayloadDecoder for RequestMessage {
-    fn decode(_bytes: &[u8]) -> Result<Self, Error> {
-        panic!("Not implemented yet")
-    }
-}
-
-impl MessagePayloadEncoder for Vec<u8> {
-    fn encode(&self) -> Vec<u8> {
-        self.clone()
-    }
-}
-
-impl MessagePayloadDecoder for Vec<u8> {
-    fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        Ok(bytes.to_vec())
-    }
-}
-
-impl Piece {
-    const PIECE_LEAD: usize = size_of::<Piece<()>>();
-
-    pub fn index(&self) -> u32 {
-        u32::from_be_bytes(self.index)
-    }
-
-    pub fn begin(&self) -> u32 {
-        u32::from_be_bytes(self.begin)
-    }
-
-    pub fn block(&self) -> &[u8] {
-        &self.block
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Option<&Self> {
-        let length = bytes.len();
-
-        if length < Self::PIECE_LEAD {
-            return None;
-        }
-
-        let piece = &bytes[..length - Self::PIECE_LEAD] as *const [u8] as *const Self;
-
-        Some(unsafe { &*piece })
+    fn encode(&mut self, item: T, dst: &mut BytesMut) -> Result<()> {
+        dst.extend(item.serialize()?);
+        Ok(())
     }
 }

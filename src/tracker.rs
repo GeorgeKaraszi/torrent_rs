@@ -1,5 +1,5 @@
 // use crate::peer::Peers;
-use crate::peer_v2::Peers;
+use crate::peer::Peers;
 use crate::types::{HashId, PeerId};
 use anyhow::{Error, Result};
 use serde::Serialize;

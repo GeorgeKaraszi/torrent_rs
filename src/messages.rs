@@ -64,11 +64,20 @@ where
     pub payload: T,
 }
 
+#[repr(C)]
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct PieceRequestMessage {
     index: [u8; 4],
     begin: [u8; 4],
     length: [u8; 4],
+}
+
+#[repr(C)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct PieceMessage {
+    index: [u8; 4],
+    begin: [u8; 4],
+    block: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -189,9 +198,9 @@ where
     }
 
     fn deserialize(data: &[u8]) -> Result<Self> {
-        let mut length_bytes = [0u8; 4];
-        length_bytes.copy_from_slice(&data[..4]);
-        let length = u32::from_be_bytes(length_bytes) as usize - 1;
+        // let mut length_bytes = [0u8; 4];
+        // length_bytes.copy_from_slice(&data[..4]);
+        let length = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize - 1;
 
         let message_tag = MessageTag::from_u8(data[4])?;
         let payload_data = &data[5..5 + length];
@@ -277,6 +286,28 @@ impl MessageSerialization for ExtensionHandshakeMessage {
     }
 }
 
+impl PieceRequestMessage {
+    pub fn new(index: u32, begin: u32, length: u32) -> Self {
+        Self {
+            index: index.to_be_bytes(),
+            begin: begin.to_be_bytes(),
+            length: length.to_be_bytes(),
+        }
+    }
+
+    pub fn index(&self) -> u32 {
+        u32::from_be_bytes(self.index)
+    }
+
+    pub fn begin(&self) -> u32 {
+        u32::from_be_bytes(self.begin)
+    }
+
+    pub fn length(&self) -> u32 {
+        u32::from_be_bytes(self.length)
+    }
+}
+
 impl MessageSerialization for PieceRequestMessage {
     fn serialize(&self) -> Result<Vec<u8>> {
         bincode::serialize(&self).map_err(Into::into)
@@ -284,6 +315,45 @@ impl MessageSerialization for PieceRequestMessage {
 
     fn deserialize(data: &[u8]) -> Result<Self> {
         bincode::deserialize(data).map_err(Into::into)
+    }
+}
+
+impl PieceMessage {
+    pub fn new(index: u32, begin: u32, block: Vec<u8>) -> Self {
+        Self {
+            index: index.to_be_bytes(),
+            begin: begin.to_be_bytes(),
+            block,
+        }
+    }
+
+    pub fn index(&self) -> u32 {
+        u32::from_be_bytes(self.index)
+    }
+
+    pub fn begin(&self) -> u32 {
+        u32::from_be_bytes(self.begin)
+    }
+
+    pub fn block(&self) -> &[u8] {
+        &self.block
+    }
+
+    pub fn length(&self) -> u32 {
+        self.block.len() as u32
+    }
+}
+
+impl MessageSerialization for PieceMessage {
+    fn serialize(&self) -> Result<Vec<u8>> {
+        bincode::serialize(&self).map_err(Into::into)
+    }
+
+    fn deserialize(data: &[u8]) -> Result<Self> {
+        let index = u32::from_be_bytes(data[..4].try_into().unwrap());
+        let begin = u32::from_be_bytes(data[4..8].try_into().unwrap());
+        let block = data[8..].to_vec();
+        Ok(Self::new(index, begin, block))
     }
 }
 
@@ -320,11 +390,11 @@ impl MessageSerialization for ExtensionPieceRequestMessage {
     }
 
     fn deserialize(data: &[u8]) -> Result<Self> {
-        let mut payload: Self = decode_bencode(data)?;
+        let mut payload: Self = serde_bencode::from_bytes(data)?;
 
         if payload.total_size > 0 {
             let piece_data = &data[(data.len() - (payload.total_size as usize))..];
-            let torrent_info: TorrentInfo = serde_bencode::from_bytes(piece_data).unwrap();
+            let torrent_info: TorrentInfo = serde_bencode::from_bytes(piece_data)?;
 
             payload.torrent_info = Some(torrent_info);
         }
